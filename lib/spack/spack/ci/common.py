@@ -609,6 +609,7 @@ class SpackCIConfig:
                     "script": [
                         "cd {env_dir}",
                         "spack env activate --without-view .",
+                        "spack spec /$SPACK_JOB_SPEC_DAG_HASH",
                         "spack ci rebuild",
                     ]
                 }
