@@ -703,7 +703,12 @@ command line. The ``dirty`` and ``install_tree`` settings come from the custom
 scopes ``./my-scope`` and ``./my-scope-2``, and all other configuration
 options come from the default configuration files that ship with Spack.
 
-.. _local-config-overrides:
+.. index::
+   single: SPACK_USER_CONFIG_PATH
+   single: SPACK_SYSTEM_CONFIG_PATH
+   single: SPACK_DISABLE_LOCAL_CONFIG
+   single: SPACK_USER_CACHE_PATH
+   :name: local-config-overrides
 
 ------------------------------
 Overriding Local Configuration

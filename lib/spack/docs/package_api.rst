@@ -41,3 +41,4 @@ Spack Package API Reference
    :show-inheritance:
    :undoc-members:
    :no-value:
+   :no-index-entry:
