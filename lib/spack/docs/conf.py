@@ -271,9 +271,10 @@ extensions = [
     "sphinx.ext.todo",
     "sphinx.ext.viewcode",
     "sphinx_copybutton",
-    "sphinxcontrib.programoutput",
     "sphinx_last_updated_by_git",
     "sphinx_sitemap",
+    "sphinxcontrib.inkscapeconverter",
+    "sphinxcontrib.programoutput",
 ]
 
 copybutton_exclude = ".linenos, .gp, .go"
@@ -496,6 +497,8 @@ sitemap_url_scheme = "{link}"
 sitemap_excludes = ["search.html", "_modules/*"]
 
 # -- Options for LaTeX output --------------------------------------------------
+
+latex_engine = "lualatex"
 
 latex_elements = {
     # The paper size ('letterpaper' or 'a4paper').
