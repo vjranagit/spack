@@ -47,6 +47,7 @@ import spack.llnl.util.lang
 import spack.llnl.util.tty as tty
 import spack.paths
 import spack.provider_index
+import spack.tag
 import spack.util.executable
 import spack.util.file_cache
 import spack.util.git
@@ -61,7 +62,6 @@ if TYPE_CHECKING:
     import spack.package_base
     import spack.patch
     import spack.spec
-    import spack.tag
 
 PKG_MODULE_PREFIX_V1 = "spack.pkg."
 PKG_MODULE_PREFIX_V2 = "spack_repo."
@@ -498,17 +498,13 @@ class TagIndexer(Indexer):
     """Lifecycle methods for a TagIndex on a Repo."""
 
     def _create(self) -> "spack.tag.TagIndex":
-        from spack.tag import TagIndex
-
-        return TagIndex(self.repository)
+        return spack.tag.TagIndex()
 
     def read(self, stream):
-        from spack.tag import TagIndex
-
-        self.index = TagIndex.from_json(stream, self.repository)
+        self.index = spack.tag.TagIndex.from_json(stream)
 
     def update(self, pkg_fullname):
-        self.index.update_package(pkg_fullname.split(".")[-1])
+        self.index.update_package(pkg_fullname.split(".")[-1], self.repository)
 
     def write(self, stream):
         self.index.to_json(stream)
@@ -815,9 +811,7 @@ class RepoPath:
     def tag_index(self) -> "spack.tag.TagIndex":
         """Merged TagIndex from all Repos in the RepoPath."""
         if self._tag_index is None:
-            from spack.tag import TagIndex
-
-            self._tag_index = TagIndex(repository=self)
+            self._tag_index = spack.tag.TagIndex()
             for repo in reversed(self.repos):
                 self._tag_index.merge(repo.tag_index)
         return self._tag_index
@@ -1366,7 +1360,8 @@ class Repo:
 
     def packages_with_tags(self, *tags: str) -> Set[str]:
         v = set(self.all_package_names())
-        v.intersection_update(*(self.tag_index[tag.lower()] for tag in tags))
+        for tag in tags:
+            v.intersection_update(self.tag_index.get_packages(tag.lower()))
         return v
 
     def all_package_classes(self) -> Generator[Type["spack.package_base.PackageBase"], None, None]:
