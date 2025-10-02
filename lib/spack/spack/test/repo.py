@@ -7,6 +7,7 @@ import pathlib
 import pytest
 
 import spack
+import spack.cmd.extensions
 import spack.environment
 import spack.package_base
 import spack.paths
@@ -288,9 +289,8 @@ class TestRepo:
     def test_extensions(self, extended, expected, mock_test_cache):
         repo = spack.repo.Repo(spack.paths.mock_packages_path, cache=mock_test_cache)
         repo_path = spack.repo.RepoPath(repo)
-        for instance in (repo, repo_path):
-            provider_names = {x.name for x in instance.extensions_for(extended)}
-            assert provider_names.issuperset(expected)
+        provider_names = spack.cmd.extensions.extensions_for(repo_path, spack.spec.Spec(extended))
+        assert set(provider_names).issuperset(expected)
 
     def test_all_package_names(self, mock_test_cache):
         repo = spack.repo.Repo(spack.paths.mock_packages_path, cache=mock_test_cache)

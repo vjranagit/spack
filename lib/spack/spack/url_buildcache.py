@@ -31,6 +31,7 @@ import spack.util.gpg
 import spack.util.url as url_util
 import spack.util.web as web_util
 from spack.schema.url_buildcache_manifest import schema as buildcache_manifest_schema
+from spack.spec_meta import SPECFILE_FORMAT_VERSION
 from spack.util.archive import ChecksumWriter
 from spack.util.crypto import hash_fun_for_algo
 from spack.util.executable import which
@@ -186,7 +187,7 @@ class URLBuildcacheEntry:
     SPEC_URL_REGEX = re.compile(r"(.+)/v([\d]+)/manifests/.+")
     LAYOUT_VERSION = 3
     BUILDCACHE_INDEX_MEDIATYPE = f"application/vnd.spack.db.v{spack.database._DB_VERSION}+json"
-    SPEC_MEDIATYPE = f"application/vnd.spack.spec.v{spack.spec.SPECFILE_FORMAT_VERSION}+json"
+    SPEC_MEDIATYPE = f"application/vnd.spack.spec.v{SPECFILE_FORMAT_VERSION}+json"
     TARBALL_MEDIATYPE = "application/vnd.spack.install.v2.tar+gzip"
     PUBLIC_KEY_MEDIATYPE = "application/pgp-keys"
     PUBLIC_KEY_INDEX_MEDIATYPE = "application/vnd.spack.keyindex.v1+json"

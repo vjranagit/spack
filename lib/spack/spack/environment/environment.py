@@ -42,6 +42,7 @@ from spack.llnl.util.filesystem import islink, readlink, symlink
 from spack.llnl.util.link_tree import ConflictingSpecsError
 from spack.schema.env import TOP_LEVEL_KEY
 from spack.spec import Spec
+from spack.spec_meta import SPECFILE_FORMAT_VERSION
 from spack.util.path import substitute_path_variables
 
 from ..enums import ConfigScopePriority
@@ -2007,8 +2008,7 @@ class Environment:
             if any(s.satisfies(t) for t in specs)
         ]
 
-    @spack.repo.autospec
-    def matching_spec(self, spec):
+    def matching_spec(self, spec: Union[str, spack.spec.Spec]) -> Optional[spack.spec.Spec]:
         """
         Given a spec (likely not concretized), find a matching concretized
         spec in the environment.
@@ -2025,6 +2025,8 @@ class Environment:
         and multiple dependency specs match, then this raises an error
         and reports all matching specs.
         """
+        if isinstance(spec, str):
+            spec = Spec(spec)
         env_root_to_user = {root.dag_hash(): user for user, root in self.concretized_specs()}
         root_matches, dep_matches = [], []
 
@@ -2149,7 +2151,7 @@ class Environment:
             "_meta": {
                 "file-type": "spack-lockfile",
                 "lockfile-version": lockfile_format_version,
-                "specfile-version": spack.spec.SPECFILE_FORMAT_VERSION,
+                "specfile-version": SPECFILE_FORMAT_VERSION,
             },
             # spack version information
             "spack": spack_dict,

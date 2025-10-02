@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Classes and functions to manage providers of virtual dependencies"""
-from typing import TYPE_CHECKING, Dict, Iterable, Optional, Set
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Union
 
 import spack.error
 import spack.util.spack_json as sjson
@@ -29,27 +29,25 @@ class _IndexBase:
     #: Calling providers_for(spec) will find specs that provide a
     #: matching implementation of MPI. Derived class need to construct
     #: this attribute according to the semantics above.
-    providers: Dict[str, Dict[str, Set[str]]]
+    providers: Dict[str, Dict["spack.spec.Spec", Set["spack.spec.Spec"]]]
 
-    def providers_for(self, virtual_spec):
+    def providers_for(
+        self, virtual_spec: Union[str, "spack.spec.Spec"]
+    ) -> List["spack.spec.Spec"]:
         """Return a list of specs of all packages that provide virtual
         packages with the supplied spec.
 
         Args:
             virtual_spec: virtual spec to be provided
         """
-        result = set()
-        # Allow string names to be passed as input, as well as specs
-        if isinstance(virtual_spec, str):
-            from spack.spec import Spec
-
-            virtual_spec = Spec(virtual_spec)
-
         # Add all the providers that satisfy the vpkg spec.
-        if virtual_spec.name in self.providers:
-            for p_spec, spec_set in self.providers[virtual_spec.name].items():
-                if p_spec.intersects(virtual_spec, deps=False):
-                    result.update(spec_set)
+        name = virtual_spec if isinstance(virtual_spec, str) else virtual_spec.name
+        if name not in self.providers:
+            return []
+        result: Set["spack.spec.Spec"] = set()
+        for p_spec, spec_set in self.providers[name].items():
+            if isinstance(virtual_spec, str) or p_spec.intersects(virtual_spec, deps=False):
+                result.update(spec_set)
 
         # Return providers in order. Defensively copy.
         return sorted(s.copy() for s in result)

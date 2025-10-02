@@ -95,9 +95,9 @@ class NoStaticAnalysis(PossibleDependencyGraph):
                     return False
         return True
 
-    def providers_for(self, virtual_str: str) -> List[spack.spec.Spec]:
-        """Returns a list of possible providers for the virtual string in input."""
-        return self.repo.providers_for(virtual_str)
+    def providers_for(self, pkg_name: str) -> List[spack.spec.Spec]:
+        """Returns a list of possible providers for the virtual package name."""
+        return self.repo.providers_for(pkg_name)
 
     def can_be_installed(self, *, pkg_name) -> bool:
         """Returns True if a package can be installed, False otherwise."""
@@ -263,11 +263,11 @@ class StaticAnalysis(NoStaticAnalysis):
         self.binary_index = binary_index
 
     @lang.memoized
-    def providers_for(self, virtual_str: str) -> List[spack.spec.Spec]:
-        candidates = super().providers_for(virtual_str)
+    def providers_for(self, pkg_name: str) -> List[spack.spec.Spec]:
+        candidates = super().providers_for(pkg_name)
         result = []
         for spec in candidates:
-            if not self._is_provider_candidate(pkg_name=spec.name, virtual=virtual_str):
+            if not self._is_provider_candidate(pkg_name=spec.name, virtual=pkg_name):
                 continue
             result.append(spec)
         return result

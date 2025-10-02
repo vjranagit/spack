@@ -20,6 +20,7 @@ import spack.error
 import spack.install_test
 import spack.llnl.util.filesystem as fs
 import spack.package_base
+import spack.repo
 import spack.spec
 import spack.store
 import spack.subprocess_context
@@ -116,7 +117,7 @@ def test_possible_dependencies(pkg_name, fn_kwargs, expected, mock_inspector):
     assert expected == result
 
 
-def test_possible_dependencies_virtual(mock_inspector, mock_packages, mpi_names):
+def test_possible_dependencies_virtual(mock_inspector, mock_packages: spack.repo.Repo, mpi_names):
     expected = set(mpi_names)
     for name in mpi_names:
         expected.update(
