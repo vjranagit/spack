@@ -4,8 +4,7 @@
 import collections
 import collections.abc
 import enum
-import errno
-import hashlib
+import gzip
 import io
 import itertools
 import json
@@ -20,13 +19,16 @@ import typing
 import warnings
 from contextlib import contextmanager
 from typing import (
-    IO,
+    Any,
     Callable,
     Dict,
+    Generator,
+    Iterable,
     Iterator,
     List,
     NamedTuple,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Type,
@@ -36,8 +38,10 @@ from typing import (
 import spack.vendor.archspec.cpu
 
 import spack
+import spack.caches
 import spack.compilers.config
 import spack.compilers.flags
+import spack.concretize
 import spack.config
 import spack.deptypes as dt
 import spack.detection
@@ -48,7 +52,6 @@ import spack.llnl.util.tty as tty
 import spack.package_base
 import spack.package_prefs
 import spack.patch
-import spack.paths
 import spack.platforms
 import spack.repo
 import spack.solver.splicing
@@ -57,6 +60,7 @@ import spack.store
 import spack.util.crypto
 import spack.util.hash
 import spack.util.libc
+import spack.util.lock as lk
 import spack.util.module_cmd as md
 import spack.util.path
 import spack.util.timer
@@ -65,9 +69,8 @@ import spack.version as vn
 import spack.version.git_ref_lookup
 from spack import traverse
 from spack.compilers.libraries import CompilerPropertyDetector
-from spack.llnl.util.filesystem import current_file_position
 from spack.llnl.util.lang import elide_list
-from spack.util.file_cache import FileCache
+from spack.util.compression import GZipFileType
 
 from .core import (
     AspFunction,
@@ -93,6 +96,10 @@ from .versions import DeclaredVersion, Provenance, concretization_version_order
 GitOrStandardVersion = Union[spack.version.GitVersion, spack.version.StandardVersion]
 
 TransformFunction = Callable[[spack.spec.Spec, List[AspFunction]], List[AspFunction]]
+
+#: strip comments and whitespace from ASP code
+_STRIP_COMMENTS_RE = re.compile(r"\%[^\n]*\n")
+_STRIP_NEWLINES_RE = re.compile(r"\s*\n\s*")
 
 
 class OutputConfiguration(NamedTuple):
@@ -343,6 +350,9 @@ class Result:
         # Abstract user requests
         self.abstract_specs = specs
 
+        # possible dependencies
+        self.possible_dependencies = None
+
         # Concrete specs
         self._concrete_specs_by_input = None
         self._concrete_specs = None
@@ -518,7 +528,7 @@ class Result:
                 msg += "\n\t(No candidate specs from solver)"
         return msg
 
-    def to_dict(self, test: bool = False) -> dict:
+    def to_dict(self) -> dict:
         """Produces dict representation of Result object
 
         Does not include anything related to unsatisfiability as we
@@ -575,7 +585,11 @@ class Result:
         if spec_list:
             spec_list = [_str_to_spec(x) for x in spec_list]
         result = Result(spec_list, asp)
-        result.criteria = obj.get("criteria")
+
+        criteria = obj.get("criteria")
+        result.criteria = (
+            None if criteria is None else [OptimizationCriteria(*t) for t in criteria]
+        )
         result.optimal = obj.get("optimal")
         result.warnings = obj.get("warnings")
         result.nmodels = obj.get("nmodels")
@@ -597,6 +611,28 @@ class Result:
             result._concrete_specs.append(_dict_to_spec(spec))
         return result
 
+    def __eq__(self, other):
+        eq = (
+            self.asp == other.asp,
+            self.satisfiable == other.satisfiable,
+            self.optimal == other.optimal,
+            self.warnings == other.warnings,
+            self.nmodels == other.nmodels,
+            self.criteria == other.criteria,
+            self.answers == other.answers,
+            self.abstract_specs == other.abstract_specs,
+            self._concrete_specs_by_input == other._concrete_specs_by_input,
+            self._concrete_specs == other._concrete_specs,
+            self._unsolved_specs == other._unsolved_specs,
+            # Not considered for equality
+            # self.control
+            # self.possible_dependencies
+            # self.cores
+            # self.possible_dependencies
+        )
+        print(eq)
+        return all(eq)
+
 
 class ConcretizationCache:
     """Store for Spack concretization results and statistics
@@ -607,137 +643,77 @@ class ConcretizationCache:
     """
 
     def __init__(self, root: Union[str, None] = None):
-        root = root or spack.config.get(
-            "config:concretization_cache:url", spack.paths.default_conc_cache_path
-        )
+        root = root or spack.config.get("concretizer:concretization_cache:url", None)
+        if root is None:
+            root = os.path.join(spack.caches.misc_cache_location(), "concretization")
         self.root = pathlib.Path(spack.util.path.canonicalize_path(root))
-        self._fc = FileCache(self.root)
-        self._cache_manifest = ".cache_manifest"
-        self._manifest_queue: List[Tuple[pathlib.Path, int]] = []
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._lockfile = self.root / ".cc_lock"
 
     def cleanup(self):
-        """Prunes the concretization cache according to configured size and entry
-        count limits. Cleanup is done in FIFO ordering."""
-        # TODO: determine a better default
-        entry_limit = spack.config.get("config:concretization_cache:entry_limit", 1000)
-        bytes_limit = spack.config.get("config:concretization_cache:size_limit", 3e8)
-        # lock the entire buildcache as we're removing a lot of data from the
-        # manifest and cache itself
-        with self._fc.read_transaction(self._cache_manifest) as f:
-            count, cache_bytes = self._extract_cache_metadata(f)
-            if not count or not cache_bytes:
-                return
-            entry_count = int(count)
-            manifest_bytes = int(cache_bytes)
-            # move beyond the metadata entry
-            f.readline()
-            if entry_count > entry_limit and entry_limit > 0:
-                with self._fc.write_transaction(self._cache_manifest) as (old, new):
-                    # prune the oldest 10% or until we have removed 10% of
-                    # total bytes starting from oldest entry
-                    # TODO: make this configurable?
-                    prune_count = entry_limit // 10
-                    lines_to_prune = f.readlines(prune_count)
-                    for i, line in enumerate(lines_to_prune):
-                        sha, cache_entry_bytes = self._parse_manifest_entry(line)
-                        if sha and cache_entry_bytes:
-                            cache_path = self._cache_path_from_hash(sha)
-                            if self._fc.remove(cache_path):
-                                entry_count -= 1
-                                manifest_bytes -= int(cache_entry_bytes)
-                        else:
-                            tty.warn(
-                                f"Invalid concretization cache entry: '{line}' on line: {i+1}"
-                            )
-                    self._write_manifest(f, entry_count, manifest_bytes)
+        """Prunes the concretization cache according to configured entry
+        count limits. Cleanup is done in LRU ordering."""
+        entry_limit = spack.config.get("concretizer:concretization_cache:entry_limit", 1000)
 
-            elif manifest_bytes > bytes_limit and bytes_limit > 0:
-                with self._fc.write_transaction(self._cache_manifest) as (old, new):
-                    # take 10% of current size off
-                    prune_amount = bytes_limit // 10
-                    total_pruned = 0
-                    i = 0
-                    while total_pruned < prune_amount:
-                        sha, manifest_cache_bytes = self._parse_manifest_entry(f.readline())
-                        if sha and manifest_cache_bytes:
-                            entry_bytes = int(manifest_cache_bytes)
-                            cache_path = self.root / sha[:2] / sha
-                            if self._safe_remove(cache_path):
-                                entry_count -= 1
-                                entry_bytes -= entry_bytes
-                                total_pruned += entry_bytes
-                        else:
-                            tty.warn(
-                                "Invalid concretization cache entry "
-                                f"'{sha} {manifest_cache_bytes}' on line: {i}"
-                            )
-                        i += 1
-                    self._write_manifest(f, entry_count, manifest_bytes)
-            for cache_dir in self.root.iterdir():
-                if cache_dir.is_dir() and not any(cache_dir.iterdir()):
-                    self._safe_remove(cache_dir)
+        # determine if we even need to clean up
+        entries = list(self.cache_entries())
+        entry_count = sum(1 for _ in entries)
+
+        # if we're under the limit, we're done.
+        if entry_count <= entry_limit:
+            return
+
+        removal_queue = []
+        # collect stat info for mod time about all entries
+        for entry in entries:
+            try:
+                entry_stat_info = entry.stat()
+                # mtime will always be time of last use as we update it after
+                # each read and obviously after each write
+                mod_time = entry_stat_info.st_mtime
+                removal_queue.append((mod_time, entry))
+            except FileNotFoundError:
+                # don't need to cleanup the file, it's not there!
+                pass
+
+        removal_queue.sort()  # sort items for removal, ascending, so oldest first
+
+        # Try to remove the oldest half of the cache.
+        for _, entry_to_rm in removal_queue[: entry_limit // 2]:
+            # short timeout, if we can't get a lock, it's being read, so it's been used
+            # more recently, i.e. not a good candidate for LRU, or the system is busy,
+            # or it's already being removed so we dont care. Could also be a write lock
+            # from another clean operation in which case that operation can remove it
+            with self.write_transaction(entry_to_rm, timeout=1e-6) as exists:
+                # cache bucket was removed by another process. that's fine; move on
+                if not exists:
+                    tty.debug(
+                        f"Attempting to purge concretization cache entry {entry_to_rm},"
+                        " but it was already removed"
+                    )
+                else:
+                    self._safe_remove(entry_to_rm)
 
     def cache_entries(self):
-        """Generator producing cache entries"""
-        for cache_dir in self.root.iterdir():
-            # ensure component is cache entry directory
-            # not metadata file
-            if cache_dir.is_dir():
-                for cache_entry in cache_dir.iterdir():
-                    if not cache_entry.is_dir():
-                        yield cache_entry
-                    else:
-                        raise RuntimeError(
-                            "Improperly formed concretization cache. "
-                            f"Directory {cache_entry.name} is improperly located "
-                            "within the concretization cache."
-                        )
+        """Generator producing cache entries within a bucket"""
+        for cache_entry in self.root.iterdir():
+            # Lockfile starts with "."
+            # old style concretization cache entries are in directories
+            if not cache_entry.name.startswith(".") and cache_entry.is_file():
+                yield cache_entry
 
-    def _parse_manifest_entry(self, line):
-        """Returns parsed manifest entry lines
-        with handling for invalid reads."""
-        if line:
-            cache_values = line.strip("\n").split(" ")
-            if len(cache_values) < 2:
-                tty.warn(f"Invalid cache entry at {line}")
-                return None, None
-        return None, None
-
-    def _write_manifest(self, manifest_file, entry_count, entry_bytes):
-        """Writes new concretization cache manifest file.
-
-        Arguments:
-            manifest_file: IO stream opened for readin
-                            and writing wrapping the manifest file
-                            with cursor at calltime set to location
-                            where manifest should be truncated
-            entry_count: new total entry count
-            entry_bytes: new total entry bytes count
-
-        """
-        persisted_entries = manifest_file.readlines()
-        manifest_file.truncate(0)
-        manifest_file.write(f"{entry_count} {entry_bytes}\n")
-        manifest_file.writelines(persisted_entries)
-
-    def _results_from_cache(self, cache_entry_buffer: IO[str]) -> Union[Result, None]:
+    def _results_from_cache(self, cache_entry_file: str) -> Union[Result, None]:
         """Returns a Results object from the concretizer cache
 
         Reads the cache hit and uses `Result`'s own deserializer
         to produce a new Result object
         """
 
-        with current_file_position(cache_entry_buffer, 0):
-            cache_str = cache_entry_buffer.read()
-            # TODO: Should this be an error if None?
-            # Same for _stats_from_cache
-            if cache_str:
-                cache_entry = json.loads(cache_str)
-                result_json = cache_entry["results"]
-                return Result.from_dict(result_json)
-        return None
+        cache_entry = json.loads(cache_entry_file)
+        result_json = cache_entry["results"]
+        return Result.from_dict(result_json)
 
-    def _stats_from_cache(self, cache_entry_buffer: IO[str]) -> Union[List, None]:
+    def _stats_from_cache(self, cache_entry_file: str) -> Union[Dict, None]:
         """Returns concretization statistic from the
         concretization associated with the cache.
 
@@ -745,90 +721,109 @@ class ConcretizationCache:
         statistics covering the cached concretization run
         and returns the Python data structures
         """
-        with current_file_position(cache_entry_buffer, 0):
-            cache_str = cache_entry_buffer.read()
-            if cache_str:
-                return json.loads(cache_str)["statistics"]
-        return None
+        return json.loads(cache_entry_file)["statistics"]
 
-    def _extract_cache_metadata(self, cache_stream: IO[str]):
-        """Extracts and returns cache entry count and bytes count from head of manifest
-        file"""
-        # make sure we're always reading from the beginning of the stream
-        # concretization cache manifest data lives at the top of the file
-        with current_file_position(cache_stream, 0):
-            return self._parse_manifest_entry(cache_stream.readline())
-
-    def _prefix_digest(self, problem: str) -> Tuple[str, str]:
+    def _prefix_digest(self, problem: str) -> str:
         """Return the first two characters of, and the full, sha256 of the given asp problem"""
-        prob_digest = hashlib.sha256(problem.encode()).hexdigest()
-        prefix = prob_digest[:2]
-        return prefix, prob_digest
+        return spack.util.hash.b32_hash(problem)
 
     def _cache_path_from_problem(self, problem: str) -> pathlib.Path:
         """Returns a Path object representing the path to the cache
-        entry for the given problem"""
-        prefix, digest = self._prefix_digest(problem)
-        return pathlib.Path(prefix) / digest
+        entry for the given problem where the problem is the sha256 of the given asp problem"""
+        prefix = self._prefix_digest(problem)
+        return self.root / prefix
 
-    def _cache_path_from_hash(self, hash: str) -> pathlib.Path:
-        """Returns a Path object representing the cache entry
-        corresponding to the given sha256 hash"""
-        return pathlib.Path(hash[:2]) / hash
-
-    def _lock_prefix_from_cache_path(self, cache_path: str):
-        """Returns the bit location corresponding to a given cache entry path
-        for file locking"""
-        return spack.util.hash.base32_prefix_bits(
-            spack.util.hash.b32_hash(cache_path), spack.util.crypto.bit_length(sys.maxsize)
-        )
-
-    def flush_manifest(self):
-        """Updates the concretization cache manifest file after a cache write operation
-        Updates the current byte count and entry counts and writes to the head of the
-        manifest file"""
-        manifest_file = self.root / self._cache_manifest
-        manifest_file.touch(exist_ok=True)
-        with open(manifest_file, "r+", encoding="utf-8") as f:
-            # check if manifest is empty
-            count, cache_bytes = self._extract_cache_metadata(f)
-            if not count or not cache_bytes:
-                # cache is unintialized
-                count = 0
-                cache_bytes = 0
-            f.seek(0, io.SEEK_END)
-            for manifest_update in self._manifest_queue:
-                entry_path, entry_bytes = manifest_update
-                count += 1
-                cache_bytes += entry_bytes
-                f.write(f"{entry_path.name} {entry_bytes}")
-            f.seek(0, io.SEEK_SET)
-            new_stats = f"{int(count)+1} {int(cache_bytes)}\n"
-            f.write(new_stats)
-
-    def _register_cache_update(self, cache_path: pathlib.Path, bytes_written: int):
-        """Adds manifest entry to update queue for later updates to the manifest"""
-        self._manifest_queue.append((cache_path, bytes_written))
-
-    def _safe_remove(self, cache_dir: pathlib.Path):
+    def _safe_remove(self, cache_dir: pathlib.Path) -> bool:
         """Removes cache entries with handling for the case where the entry has been
         removed already or there are multiple cache entries in a directory"""
         try:
-            if cache_dir.is_dir():
-                cache_dir.rmdir()
-            else:
-                cache_dir.unlink()
+            cache_dir.unlink()
             return True
         except FileNotFoundError:
-            # This is acceptable, removal is idempotent
+            # That's fine, removal is idempotent
             pass
         except OSError as e:
-            if e.errno == errno.ENOTEMPTY:
-                # there exists another cache entry in this directory, don't clean yet
-                pass
+            # Catch other timing/access related issues
+            tty.debug(
+                f"Exception occured while attempting to remove Concretization Cache entry, {e}"
+            )
+            pass
         return False
 
-    def store(self, problem: str, result: Result, statistics: List, test: bool = False):
+    def _lock(self, path: pathlib.Path, timeout: Optional[float] = None) -> lk.Lock:
+        """Returns a lock over the byte range correspnding to the hash of the asp problem.
+
+        ``path`` is a path to a file in the cache, and its basename is the hash of the problem.
+
+        Args:
+
+            path: absolute path to concretization cache entry to be locked
+        """
+        return lk.Lock(
+            str(self._lockfile),
+            start=spack.util.hash.base32_prefix_bits(
+                path.name, spack.util.crypto.bit_length(sys.maxsize)
+            ),
+            length=1,
+            default_timeout=timeout if timeout else None,
+            desc=f"Concretization cache lock for {path}",
+        )
+
+    @contextmanager
+    def read_transaction(self, path: pathlib.Path, timeout: Optional[float] = None):
+        """Read transactions for concretization cache entries.
+
+        Takes a read lock on the cache entry indicated by ``path`` and returns
+        control back to the caller releases lock on exit
+
+        Args:
+            path: absolute path to the concretization cache entry to be locked
+
+        """
+        assert path.is_absolute()
+        lock = self._lock(path, timeout=timeout)
+        locked = False
+        try:
+            # can timeout
+            # if it does, no lock is acquired so we
+            # must be careful about releasing
+            lock.acquire_read()
+            locked = True
+            yield path.exists()
+        except lk.LockTimeoutError:
+            # if read lock times out, just exit early
+            tty.debug(f"Concretization cache read lock on {path} timed out")
+        finally:
+            if locked:
+                lock.release_read()
+
+    @contextmanager
+    def write_transaction(self, path: pathlib.Path, timeout: Optional[float] = None):
+        """Write transactions for concretization cache entries
+
+        Takes a write lock on the cache entry indicated by ``path`` and returns
+        control back to the caller releases lock on exit
+
+        Args:
+            path: absolute path to the concretization cache entry to be locked
+
+        """
+        # path must be absolute at this point
+        assert path.is_absolute()
+        lock = self._lock(path, timeout=timeout)
+        locked = False
+        try:
+            lock.acquire_write()
+            locked = True
+            yield path.exists()
+        except lk.LockTimeoutError:
+            # if read lock times out, just exit early
+            tty.debug(f"Concretization cache write lock on {path} timed out")
+        finally:
+            if locked:
+                lock.release_write()
+
+    def store(self, problem: str, result: Result, statistics: List) -> None:
         """Creates entry in concretization cache for problem if none exists,
         storing the concretization Result object and statistics in the cache
         as serialized json joined as a single file.
@@ -837,21 +832,19 @@ class ConcretizationCache:
         problem.
         """
         cache_path = self._cache_path_from_problem(problem)
-        if self._fc.init_entry(cache_path):
-            # if an entry for this conc hash exists already, we're don't want
-            # to overwrite, just exit
-            tty.debug(f"Cache entry {cache_path} exists, will not be overwritten")
-            return
-        with self._fc.write_transaction(cache_path) as (old, new):
-            if old:
-                # Entry for this conc hash exists already, do not overwrite
-                tty.debug(f"Cache entry {cache_path} exists, will not be overwritten")
-                return
-            cache_dict = {"results": result.to_dict(test=test), "statistics": statistics}
-            bytes_written = new.write(json.dumps(cache_dict))
-            self._register_cache_update(cache_path, bytes_written)
 
-    def fetch(self, problem: str) -> Union[Tuple[Result, List], Tuple[None, None]]:
+        with self.write_transaction(cache_path, timeout=30) as exists:
+            if exists:
+                # if cache path file exists, we already have a cache
+                # entry for this, likely created by another process
+                # exit early
+                # just opening it updates atime to indicate recent use
+                return
+            with gzip.open(cache_path, "xb", compresslevel=6) as cache_entry:
+                cache_dict = {"results": result.to_dict(), "statistics": statistics}
+                cache_entry.write(json.dumps(cache_dict).encode())
+
+    def fetch(self, problem: str) -> Union[Tuple[Result, Dict], Tuple[None, None]]:
         """Returns the concretization cache result for a lookup based on the given problem.
 
         Checks the concretization cache for the given problem, and either returns the
@@ -860,20 +853,39 @@ class ConcretizationCache:
         """
         cache_path = self._cache_path_from_problem(problem)
         result, statistics = None, None
-        with self._fc.read_transaction(cache_path) as f:
-            if f:
-                result = self._results_from_cache(f)
-                statistics = self._stats_from_cache(f)
+        with self.read_transaction(cache_path, timeout=2) as exists:
+            # if exists is false, then there's no chance of a hit
+            if exists:
+                cache_entry_content = None
+                try:
+                    with gzip.open(cache_path, "rb", compresslevel=6) as f:
+                        f.peek(1)  # Try to read at least one byte
+                        f.seek(0)
+                        cache_entry_content = f.read().decode("utf-8")
+                except FileNotFoundError:
+                    # cache miss
+                    pass
+                except OSError:
+                    # Cache may have been created pre compression
+                    # check if gzip, and if not, read from plaintext
+                    # otherwise re raise
+                    with open(cache_path, "rb") as f:
+                        # ensure the file was not just a gzip file we failed
+                        # to open
+                        if not GZipFileType().matches_magic(f):
+                            cache_entry_content = f.read().decode()
+                        else:
+                            raise
+                if cache_entry_content:
+                    # update mod/access time for use w/ LRU cleanup
+                    os.utime(cache_path)
+                    result = self._results_from_cache(cache_entry_content)
+                    statistics = self._stats_from_cache(cache_entry_content)
         if result and statistics:
             tty.debug(f"Concretization cache hit at {str(cache_path)}")
             return result, statistics
         tty.debug(f"Concretization cache miss at {str(cache_path)}")
         return None, None
-
-
-CONC_CACHE: ConcretizationCache = spack.llnl.util.lang.Singleton(
-    lambda: ConcretizationCache()
-)  # type: ignore
 
 
 def _is_checksummed_git_version(v):
@@ -1035,28 +1047,180 @@ class ErrorHandler:
 
 
 class PyclingoDriver:
-    def __init__(self, cores=True):
+    def __init__(self, cores=True, conc_cache: Optional[ConcretizationCache] = None):
         """Driver for the Python clingo interface.
 
         Arguments:
             cores (bool): whether to generate unsatisfiable cores for better
                 error reporting.
+            conc_cache (ConcretizationCache)
         """
         self.cores = cores
         # This attribute will be reset at each call to solve
-        self.control = None
+        self.control: Any = None  # TODO: fix typing of dynamic clingo import
+        self._conc_cache = conc_cache
 
-    def solve(self, setup, specs, reuse=None, output=None, control=None, allow_deprecated=False):
+    def _control_file_paths(self, control_files: List[str]) -> List[str]:
+        """Get absolute paths based on relative paths of control files.
+
+        Right now the control files just live next to this file in the Spack tree.
+        """
+        parent_dir = os.path.dirname(__file__)
+        return [os.path.join(parent_dir, rel_path) for rel_path in control_files]
+
+    def _make_cache_key(self, asp_problem: List[str], control_file_paths: List[str]) -> str:
+        """Make a key for fetching a solve from the concretization cache.
+
+        A key comprises the entire input to clingo, i.e., the problem instance plus the
+        control files.  The problem instance is assumed to already be sorted and stripped of
+        comments and empty lines.
+
+        The control files are stripped but not sorted, so changes to the control files will cause
+        cache misses if they modify any code.
+
+        Arguments:
+            asp_problem: list of statements in the ASP program
+            control_file_paths: list of paths to control files we'll send to clingo
+        """
+        lines = list(asp_problem)
+        for path in control_file_paths:
+            with open(path, "r", encoding="utf-8") as f:
+                lines.extend(strip_asp_problem(f.readlines()))
+
+        return "\n".join(lines)
+
+    def _run_clingo(
+        self,
+        specs: List[spack.spec.Spec],
+        setup: "SpackSolverSetup",
+        problem_str: str,
+        control_file_paths: List[str],
+        timer: spack.util.timer.Timer,
+    ) -> Result:
+        """Actually run clingo and generate a result.
+
+        This is the core solve logic once the setup is done and once we know we can't
+        fetch a result from cache. See ``solve()`` for caching and setup logic.
+        """
+        # We could just take the cache_key and add it to clingo (since it is the
+        # full problem representation), but we load conrol files separately as it
+        # makes clingo give us better, file-aware error messages.
+        with timer.measure("load"):
+            # Add the problem instance
+            self.control.add("base", [], problem_str)
+            # Load additinoal files
+            for path in control_file_paths:
+                self.control.load(path)
+
+        # Grounding is the first step in the solve -- it turns our facts
+        # and first-order logic rules into propositional logic.
+        with timer.measure("ground"):
+            self.control.ground([("base", [])])
+
+        # With a grounded program, we can run the solve.
+        models = []  # stable models if things go well
+        cores: List = []  # unsatisfiable cores if they do not
+
+        def on_model(model):
+            models.append((model.cost, model.symbols(shown=True, terms=True)))
+
+        solve_kwargs = {
+            "assumptions": setup.assumptions,
+            "on_model": on_model,
+            "on_core": cores.append,
+        }
+
+        if clingo_cffi():
+            solve_kwargs["on_unsat"] = cores.append
+
+        timer.start("solve")
+        # A timeout of 0 means no timeout
+        time_limit = spack.config.CONFIG.get("concretizer:timeout", 0)
+        timeout_end = time.monotonic() + time_limit if time_limit > 0 else float("inf")
+        error_on_timeout = spack.config.CONFIG.get("concretizer:error_on_timeout", True)
+        with self.control.solve(**solve_kwargs, async_=True) as handle:
+            # Allow handling of interrupts every second.
+            #
+            # pyclingo's `SolveHandle` blocks the calling thread for the duration of each
+            # `.wait()` call. Python also requires that signal handlers must be handled in
+            # the main thread, so any `KeyboardInterrupt` is postponed until after the
+            # `.wait()` call exits the control of pyclingo.
+            finished = False
+            while not finished and time.monotonic() < timeout_end:
+                finished = handle.wait(1.0)
+
+            if not finished:
+                specs_str = ", ".join(spack.llnl.util.lang.elide_list([str(s) for s in specs], 4))
+                header = f"Spack is taking more than {time_limit} seconds to solve for {specs_str}"
+                if error_on_timeout:
+                    raise UnsatisfiableSpecError(f"{header}, stopping concretization")
+                warnings.warn(f"{header}, using the best configuration found so far")
+                handle.cancel()
+
+            solve_result = handle.get()
+        timer.stop("solve")
+
+        # once done, construct the solve result
+        result = Result(specs)
+        result.satisfiable = solve_result.satisfiable
+
+        if result.satisfiable:
+            timer.start("construct_specs")
+            # get the best model
+            builder = SpecBuilder(specs, hash_lookup=setup.reusable_and_possible)
+            min_cost, best_model = min(models)
+
+            # first check for errors
+            error_handler = ErrorHandler(best_model, specs)
+            error_handler.raise_if_errors()
+
+            # build specs from spec attributes in the model
+            spec_attrs = [(name, tuple(rest)) for name, *rest in extract_args(best_model, "attr")]
+            answers = builder.build_specs(spec_attrs)
+
+            # add best spec to the results
+            result.answers.append((list(min_cost), 0, answers))
+
+            # get optimization criteria
+            criteria_args = extract_args(best_model, "opt_criterion")
+            result.criteria = build_criteria_names(min_cost, criteria_args)
+
+            # record the number of models the solver considered
+            result.nmodels = len(models)
+
+            # record the possible dependencies in the solve
+            result.possible_dependencies = setup.pkgs
+            timer.stop("construct_specs")
+            timer.stop()
+
+        elif cores:
+            result.control = self.control
+            result.cores.extend(cores)
+
+        result.raise_if_unsat()
+
+        if result.satisfiable and result.unsolved_specs and setup.concretize_everything:
+            raise OutputDoesNotSatisfyInputError(result.unsolved_specs)
+
+        return result
+
+    def solve(
+        self,
+        setup: "SpackSolverSetup",
+        specs: List[spack.spec.Spec],
+        reuse: Optional[List[spack.spec.Spec]] = None,
+        output: Optional[OutputConfiguration] = None,
+        control: Optional[Any] = None,  # TODO: figure out how to annotate clingo.Control
+        allow_deprecated: bool = False,
+    ) -> Tuple[Result, Optional[spack.util.timer.Timer], Optional[Dict]]:
         """Set up the input and solve for dependencies of ``specs``.
 
         Arguments:
-            setup (SpackSolverSetup): An object to set up the ASP problem.
-            specs (list): List of ``Spec`` objects to solve for.
-            reuse (None or list): list of concrete specs that can be reused
-            output (None or OutputConfiguration): configuration object to set
-                the output of this solve.
-            control (clingo.Control): configuration for the solver. If None,
-                default values will be used
+            setup: An object to set up the ASP problem.
+            specs: List of ``Spec`` objects to solve for.
+            reuse: list of concrete specs that can be reused
+            output: configuration object to set the output of this solve.
+            control: configuration for the solver. If None, default values will be used
             allow_deprecated: if True, allow deprecated versions in the solve
 
         Return:
@@ -1078,6 +1242,9 @@ class PyclingoDriver:
         if sys.platform == "win32":
             tty.debug("Ensuring basic dependencies {win-sdk, wgl} available")
             ensure_winsdk_external_or_raise()
+
+        # assemble a list of the control files needed for this problem. Some are conditionally
+        # included depending on what features we're using in the solve.
         control_files = ["concretize.lp", "heuristic.lp", "display.lp", "direct_dependency.lp"]
         if not setup.concretize_everything:
             control_files.append("when_possible.lp")
@@ -1089,151 +1256,61 @@ class PyclingoDriver:
             control_files.append("splices.lp")
 
         timer.start("setup")
-        output_is_set = output.out is not None
-        asp_problem = setup.setup(
+        problem_builder = setup.setup(
             specs,
             reuse=reuse,
             allow_deprecated=allow_deprecated,
-            _use_unsat_cores=not output_is_set,
+            _use_unsat_cores=output.out is None,
         )
-        if output_is_set:
-            output.out.write(asp_problem)
-        if output.setup_only:
-            return Result(specs), None, None
         timer.stop("setup")
 
-        timer.start("cache-check")
         timer.start("ordering")
-        # ensure deterministic output
-        problem_repr = "\n".join(sorted(asp_problem.split("\n")))
+        # print the output with comments, etc. if the user asked
+        problem = problem_builder.asp_problem
+        if output.out is not None:
+            output.out.write("\n".join(problem))
+
+        if output.setup_only:
+            return Result(specs), None, None
+
+        # strip the problem of comments and empty lines
+        problem = strip_asp_problem(problem)
+        randomize = "SPACK_SOLVER_RANDOMIZATION" in os.environ
+        if randomize:
+            # create a shuffled copy -- useful for understanding performance variation
+            problem = random.sample(problem, len(problem))
+        else:
+            problem.sort()  # sort for deterministic output
+
         timer.stop("ordering")
-        parent_dir = os.path.dirname(__file__)
-        full_path = lambda x: os.path.join(parent_dir, x)
-        abs_control_files = [full_path(x) for x in control_files]
-        for ctrl_file in abs_control_files:
-            with open(ctrl_file, "r", encoding="utf-8") as f:
-                problem_repr += "\n" + f.read()
 
-        result = None
-        conc_cache_enabled = spack.config.get("config:concretization_cache:enable", False)
-        if conc_cache_enabled:
-            result, concretization_stats = CONC_CACHE.fetch(problem_repr)
+        timer.start("cache-check")
+        # load control files to add to the input representation
+        control_file_paths = self._control_file_paths(control_files)
+        cache_key = self._make_cache_key(problem, control_file_paths)
 
+        result, concretization_stats = None, None
+        conc_cache_enabled = spack.config.get("concretizer:concretization_cache:enable", False)
+        if conc_cache_enabled and self._conc_cache:
+            result, concretization_stats = self._conc_cache.fetch(cache_key)
         timer.stop("cache-check")
+
+        # run the solver and store the result, if it wasn't cached already
         if not result:
-            timer.start("load")
-            # Add the problem instance
-            self.control.add("base", [], asp_problem)
-            # Load the files
-            [self.control.load(lp) for lp in abs_control_files]
-            timer.stop("load")
+            problem_repr = "\n".join(problem)
+            result = self._run_clingo(specs, setup, problem_repr, control_file_paths, timer)
+            if conc_cache_enabled and self._conc_cache:
+                self._conc_cache.store(cache_key, result, self.control.statistics)
 
-            # Grounding is the first step in the solve -- it turns our facts
-            # and first-order logic rules into propositional logic.
-            timer.start("ground")
-            self.control.ground([("base", [])])
-            timer.stop("ground")
-
-            # With a grounded program, we can run the solve.
-            models = []  # stable models if things go well
-            cores = []  # unsatisfiable cores if they do not
-
-            def on_model(model):
-                models.append((model.cost, model.symbols(shown=True, terms=True)))
-
-            solve_kwargs = {
-                "assumptions": setup.assumptions,
-                "on_model": on_model,
-                "on_core": cores.append,
-            }
-
-            if clingo_cffi():
-                solve_kwargs["on_unsat"] = cores.append
-
-            timer.start("solve")
-            # A timeout of 0 means no timeout
-            time_limit = spack.config.CONFIG.get("concretizer:timeout", 0)
-            timeout_end = time.monotonic() + time_limit if time_limit > 0 else float("inf")
-            error_on_timeout = spack.config.CONFIG.get("concretizer:error_on_timeout", True)
-            with self.control.solve(**solve_kwargs, async_=True) as handle:
-                # Allow handling of interrupts every second.
-                #
-                # pyclingo's `SolveHandle` blocks the calling thread for the duration of each
-                # `.wait()` call. Python also requires that signal handlers must be handled in
-                # the main thread, so any `KeyboardInterrupt` is postponed until after the
-                # `.wait()` call exits the control of pyclingo.
-                finished = False
-                while not finished and time.monotonic() < timeout_end:
-                    finished = handle.wait(1.0)
-
-                if not finished:
-                    specs_str = ", ".join(
-                        spack.llnl.util.lang.elide_list([str(s) for s in specs], 4)
-                    )
-                    header = (
-                        f"Spack is taking more than {time_limit} seconds to solve for {specs_str}"
-                    )
-                    if error_on_timeout:
-                        raise UnsatisfiableSpecError(f"{header}, stopping concretization")
-                    warnings.warn(f"{header}, using the best configuration found so far")
-                    handle.cancel()
-
-                solve_result = handle.get()
-            timer.stop("solve")
-
-            # once done, construct the solve result
-            result = Result(specs)
-            result.satisfiable = solve_result.satisfiable
-
-            if result.satisfiable:
-                timer.start("construct_specs")
-                # get the best model
-                builder = SpecBuilder(specs, hash_lookup=setup.reusable_and_possible)
-                min_cost, best_model = min(models)
-
-                # first check for errors
-                error_handler = ErrorHandler(best_model, specs)
-                error_handler.raise_if_errors()
-
-                # build specs from spec attributes in the model
-                spec_attrs = [
-                    (name, tuple(rest)) for name, *rest in extract_args(best_model, "attr")
-                ]
-                answers = builder.build_specs(spec_attrs)
-
-                # add best spec to the results
-                result.answers.append((list(min_cost), 0, answers))
-
-                # get optimization criteria
-                criteria_args = extract_args(best_model, "opt_criterion")
-                result.criteria = build_criteria_names(min_cost, criteria_args)
-
-                # record the number of models the solver considered
-                result.nmodels = len(models)
-
-                # record the possible dependencies in the solve
-                result.possible_dependencies = setup.pkgs
-                timer.stop("construct_specs")
-                timer.stop()
-            elif cores:
-                result.control = self.control
-                result.cores.extend(cores)
-
-            result.raise_if_unsat()
-
-            if result.satisfiable and result.unsolved_specs and setup.concretize_everything:
-                raise OutputDoesNotSatisfyInputError(result.unsolved_specs)
-
-            if conc_cache_enabled:
-                CONC_CACHE.store(problem_repr, result, self.control.statistics, test=setup.tests)
-            concretization_stats = self.control.statistics
         if output.timers:
             timer.write_tty()
             print()
 
+        concretization_stats = concretization_stats or self.control.statistics
         if output.stats:
             print("Statistics:")
             pprint.pprint(concretization_stats)
+
         return result, timer, concretization_stats
 
 
@@ -1417,7 +1494,7 @@ class SpackSolverSetup:
 
     gen: "ProblemInstanceBuilder"
 
-    def __init__(self, tests: bool = False):
+    def __init__(self, tests: spack.concretize.TestsType = False):
         self.possible_graph = create_graph_analyzer()
 
         # these are all initialized in setup()
@@ -2875,7 +2952,7 @@ class SpackSolverSetup:
         """Define what version_satisfies(...) means in ASP logic."""
 
         for pkg_name, versions in sorted(self.possible_versions.items()):
-            for v in versions:
+            for v in sorted(versions):
                 if v in self.git_commit_versions[pkg_name]:
                     sha = self.git_commit_versions[pkg_name].get(v)
                     if sha:
@@ -2973,8 +3050,8 @@ class SpackSolverSetup:
         variant definitions.
 
         """
-        # Tell the concretizer about possible values from specs seen in spec_clauses().
-        # We might want to order these facts by pkg and name if we are debugging.
+        # for determinism, sort by variant ids, not variant def ids (which are object ids)
+        def_info = []
         for pkg_name, variant_def_id, value in sorted(self.variant_values_from_specs):
             try:
                 vid = self.variant_ids_by_def_id[variant_def_id]
@@ -2983,7 +3060,10 @@ class SpackSolverSetup:
                     f"[{__name__}] cannot retrieve id of the {value} variant from {pkg_name}"
                 )
                 continue
+            def_info.append((pkg_name, vid, value))
 
+        # Tell the concretizer about possible values from specs seen in spec_clauses().
+        for pkg_name, vid, value in sorted(def_info):
             self.gen.fact(fn.pkg_fact(pkg_name, fn.variant_possible_value(vid, value)))
 
     def register_concrete_spec(self, spec, possible):
@@ -3038,12 +3118,12 @@ class SpackSolverSetup:
 
     def setup(
         self,
-        specs: List[spack.spec.Spec],
+        specs: Sequence[spack.spec.Spec],
         *,
         reuse: Optional[List[spack.spec.Spec]] = None,
         allow_deprecated: bool = False,
         _use_unsat_cores: bool = True,
-    ) -> str:
+    ) -> "ProblemInstanceBuilder":
         """Generate an ASP program with relevant constraints for specs.
 
         This calls methods on the solve driver to set up the problem with
@@ -3055,10 +3135,13 @@ class SpackSolverSetup:
             reuse: list of concrete specs that can be reused
             allow_deprecated: if True adds deprecated versions into the solve
             _use_unsat_cores: if True, use unsat cores for internal errors
+
+        Return:
+            A ProblemInstanceBuilder populated with facts and rules for an ASP solve.
         """
         reuse = reuse or []
         check_packages_exist(specs)
-        self.gen = ProblemInstanceBuilder(randomize="SPACK_SOLVER_RANDOMIZATION" in os.environ)
+        self.gen = ProblemInstanceBuilder()
 
         # Compute possible compilers first, so we can record which dependencies they might inject
         _ = spack.compilers.config.all_compilers(init_config=True)
@@ -3080,13 +3163,17 @@ class SpackSolverSetup:
 
         candidate_compilers.update(compilers_from_reuse)
         self.possible_compilers = list(candidate_compilers)
-        self.possible_compilers.sort()  # type: ignore[call-arg]
+
+        # TODO: warning is because mypy doesn't know Spec supports rich comparison via decorator
+        self.possible_compilers.sort()  # type: ignore[call-arg,call-overload]
 
         self.gen.h1("Runtimes")
         injected_dependencies = self.define_runtime_constraints()
 
         node_counter = create_counter(
-            specs + injected_dependencies, tests=self.tests, possible_graph=self.possible_graph
+            list(specs) + injected_dependencies,
+            tests=self.tests,
+            possible_graph=self.possible_graph,
         )
         self.possible_virtuals = node_counter.possible_virtuals()
         self.pkgs = node_counter.possible_dependencies()
@@ -3206,7 +3293,7 @@ class SpackSolverSetup:
         self.gen.h1("Internal errors")
         self.internal_errors(_use_unsat_cores=_use_unsat_cores)
 
-        return self.gen.value()
+        return self.gen
 
     def internal_errors(self, *, _use_unsat_cores: bool):
         parent_dir = os.path.dirname(__file__)
@@ -3222,9 +3309,9 @@ class SpackSolverSetup:
                                 symbol = AspFunction(name)(arg.string)
                                 if _use_unsat_cores:
                                     self.assumptions.append((parse_term(str(symbol)), True))
-                                    self.gen.asp_problem.append(f"{{ {symbol} }}.\n")
+                                    self.gen.asp_problem.append(f"{{{symbol}}}.")
                                 else:
-                                    self.gen.asp_problem.append(f"{symbol}.\n")
+                                    self.gen.asp_problem.append(f"{symbol}.")
 
         path = os.path.join(parent_dir, "concretize.lp")
         parse_files([path], visit)
@@ -3486,6 +3573,19 @@ class _Body:
     propagate = fn.attr("propagate")
 
 
+def strip_asp_problem(asp_problem: Iterable[str]) -> List[str]:
+    """Remove comments and empty lines from an ASP program."""
+
+    def strip_statement(stmt: str) -> str:
+        lines = [line for line in stmt.split("\n") if not line.startswith("%")]
+        return "".join(line.strip() for line in lines if line)
+
+    value = [strip_statement(stmt) for stmt in asp_problem]
+    value = [s for s in value if s]
+
+    return value
+
+
 class ProblemInstanceBuilder:
     """Provides an interface to construct a problem instance.
 
@@ -3497,23 +3597,23 @@ class ProblemInstanceBuilder:
 
     The problem instance can be added directly to the "control" structure of clingo.
 
-    Arguments:
-        randomize: whether to randomize the order of facts to the solver. Useful for benchmarking.
     """
 
-    def __init__(self, randomize: bool = False) -> None:
-        self.randomize = randomize
+    def __init__(self) -> None:
         self.asp_problem: List[str] = []
 
     def fact(self, atom: AspFunction) -> None:
-        self.asp_problem.append(f"{atom}.\n")
+        self.asp_problem.append(f"{atom}.")
 
     def append(self, rule: str) -> None:
         self.asp_problem.append(rule)
 
     def title(self, header: str, char: str) -> None:
         sep = char * 76
-        self.asp_problem.append(f"\n%{sep}\n% {header}\n%{sep}\n")
+        self.newline()
+        self.asp_problem.append(f"%{sep}")
+        self.asp_problem.append(f"% {header}")
+        self.asp_problem.append(f"%{sep}")
 
     def h1(self, header: str) -> None:
         self.title(header, "=")
@@ -3522,15 +3622,10 @@ class ProblemInstanceBuilder:
         self.title(header, "-")
 
     def h3(self, header: str):
-        self.asp_problem.append(f"% {header}\n")
+        self.asp_problem.append(f"% {header}")
 
     def newline(self):
-        self.asp_problem.append("\n")
-
-    def value(self) -> str:
-        if self.randomize:
-            random.shuffle(self.asp_problem)
-        return "".join(self.asp_problem)
+        self.asp_problem.append("")
 
 
 def possible_compilers(*, configuration) -> Tuple[Set["spack.spec.Spec"], Set["spack.spec.Spec"]]:
@@ -4241,12 +4336,13 @@ class Solver:
     """
 
     def __init__(self):
-        self.driver = PyclingoDriver()
+        self._conc_cache = ConcretizationCache()
+        self.driver = PyclingoDriver(conc_cache=self._conc_cache)
         self.selector = ReusableSpecsSelector(configuration=spack.config.CONFIG)
 
     @staticmethod
     def _check_input_and_extract_concrete_specs(
-        specs: List[spack.spec.Spec],
+        specs: Sequence[spack.spec.Spec],
     ) -> List[spack.spec.Spec]:
         reusable: List[spack.spec.Spec] = []
         analyzer = create_graph_analyzer()
@@ -4286,27 +4382,27 @@ class Solver:
 
     def solve_with_stats(
         self,
-        specs,
-        out=None,
-        timers=False,
-        stats=False,
-        tests=False,
-        setup_only=False,
-        allow_deprecated=False,
-    ):
+        specs: Sequence[spack.spec.Spec],
+        out: Optional[io.IOBase] = None,
+        timers: bool = False,
+        stats: bool = False,
+        tests: spack.concretize.TestsType = False,
+        setup_only: bool = False,
+        allow_deprecated: bool = False,
+    ) -> Tuple[Result, Optional[spack.util.timer.Timer], Optional[Dict]]:
         """
         Concretize a set of specs and track the timing and statistics for the solve
 
         Arguments:
-          specs (list): List of ``Spec`` objects to solve for.
+          specs: List of ``Spec`` objects to solve for.
           out: Optionally write the generate ASP program to a file-like object.
-          timers (bool): Print out coarse timers for different solve phases.
-          stats (bool): Print out detailed stats from clingo.
-          tests (bool or tuple): If True, concretize test dependencies for all packages.
+          timers: Print out coarse timers for different solve phases.
+          stats: Print out detailed stats from clingo.
+          tests: If True, concretize test dependencies for all packages.
             If a tuple of package names, concretize test dependencies for named
             packages (defaults to False: do not concretize test dependencies).
-          setup_only (bool): if True, stop after setup and don't solve (default False).
-          allow_deprecated (bool): allow deprecated version in the solve
+          setup_only: if True, stop after setup and don't solve (default False).
+          allow_deprecated: allow deprecated version in the solve
         """
         specs = [s.lookup_hash() for s in specs]
         reusable_specs = self._check_input_and_extract_concrete_specs(specs)
@@ -4314,13 +4410,13 @@ class Solver:
         setup = SpackSolverSetup(tests=tests)
         output = OutputConfiguration(timers=timers, stats=stats, out=out, setup_only=setup_only)
 
-        CONC_CACHE.flush_manifest()
-        CONC_CACHE.cleanup()
-        return self.driver.solve(
+        result = self.driver.solve(
             setup, specs, reuse=reusable_specs, output=output, allow_deprecated=allow_deprecated
         )
+        self._conc_cache.cleanup()
+        return result
 
-    def solve(self, specs, **kwargs):
+    def solve(self, specs: Sequence[spack.spec.Spec], **kwargs) -> Result:
         """
         Convenience function for concretizing a set of specs and ignoring timing
         and statistics. Uses the same kwargs as solve_with_stats.
@@ -4330,8 +4426,14 @@ class Solver:
         return result
 
     def solve_in_rounds(
-        self, specs, out=None, timers=False, stats=False, tests=False, allow_deprecated=False
-    ):
+        self,
+        specs: Sequence[spack.spec.Spec],
+        out: Optional[io.IOBase] = None,
+        timers: bool = False,
+        stats: bool = False,
+        tests: spack.concretize.TestsType = False,
+        allow_deprecated: bool = False,
+    ) -> Generator[Result, None, None]:
         """Solve for a stable model of specs in multiple rounds.
 
         This relaxes the assumption of solve that everything must be consistent and
@@ -4381,8 +4483,7 @@ class Solver:
             for spec in result.specs:
                 reusable_specs.extend(spec.traverse())
 
-        CONC_CACHE.flush_manifest()
-        CONC_CACHE.cleanup()
+        self._conc_cache.cleanup()
 
 
 class UnsatisfiableSpecError(spack.error.UnsatisfiableSpecError):

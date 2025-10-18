@@ -1,6 +1,8 @@
 # Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
+import difflib
+import json
 import os
 import pathlib
 import platform
@@ -36,6 +38,7 @@ import spack.spec
 import spack.store
 import spack.test.conftest
 import spack.util.file_cache
+import spack.util.hash
 import spack.util.spack_yaml as syaml
 import spack.variant as vt
 from spack.installer import PackageInstaller
@@ -2017,7 +2020,7 @@ class TestConcretize:
         mutable_config.set("packages", packages_yaml["packages"])
 
         setup = spack.solver.asp.SpackSolverSetup()
-        asp_problem = setup.setup([Spec("mpileaks")], reuse=[], allow_deprecated=False)
+        asp_problem = setup.setup([Spec("mpileaks")], reuse=[], allow_deprecated=False).asp_problem
 
         assert all(x in asp_problem for x in expected)
 
@@ -3348,59 +3351,6 @@ def test_commit_variant_can_be_reused(installed_commit, incoming_commit, reusabl
         assert (spec1.dag_hash() == spec2.dag_hash()) == reusable
 
 
-def test_concretization_cache_roundtrip(
-    mock_packages, use_concretization_cache, monkeypatch, mutable_config
-):
-    """Tests whether we can write the results of a clingo solve to the cache
-    and load the same spec request from the cache to produce identical specs"""
-    # Force determinism:
-    # Solver setup is normally non-deterministic due to non-determinism in
-    # asp solver setup logic generation. The only other inputs to the cache keys are
-    # the .lp files, which are invariant over the course of this test.
-    # This method forces the same setup to be produced for the same specs
-    # which gives us a guarantee of cache hits, as it removes the only
-    # element of non deterministic solver setup for the same spec
-    # Basically just a quick and dirty memoization
-    solver_setup = spack.solver.asp.SpackSolverSetup.setup
-
-    def _setup(self, specs, *, reuse=None, allow_deprecated=False, _use_unsat_cores=True):
-        if not getattr(_setup, "cache_setup", None):
-            cache_setup = solver_setup(self, specs, reuse=reuse, allow_deprecated=allow_deprecated)
-            setattr(_setup, "cache_setup", cache_setup)
-        return getattr(_setup, "cache_setup")
-
-    # monkeypatch our forced determinism setup method into solver setup
-    monkeypatch.setattr(spack.solver.asp.SpackSolverSetup, "setup", _setup)
-
-    assert spack.config.get("config:concretization_cache:enable")
-
-    # run one standard concretization to populate the cache and the setup method
-    # memoization
-    h = spack.concretize.concretize_one("hdf5")
-
-    # due to our forced determinism above, we should not be observing
-    # cache misses, assert that we're not storing any new cache entries
-    def _ensure_no_store(self, problem: str, result, statistics, test=False):
-        # always throw, we never want to reach this code path
-        assert False, "Concretization cache hit expected"
-
-    # Assert that we're actually hitting the cache
-    cache_fetch = spack.solver.asp.ConcretizationCache.fetch
-
-    def _ensure_cache_hits(self, problem: str):
-        result, statistics = cache_fetch(self, problem)
-        assert result, "Expected successful concretization cache hit"
-        assert statistics, "Expected statistics to be non null on cache hit"
-        return result, statistics
-
-    monkeypatch.setattr(spack.solver.asp.ConcretizationCache, "store", _ensure_no_store)
-    monkeypatch.setattr(spack.solver.asp.ConcretizationCache, "fetch", _ensure_cache_hits)
-    # ensure subsequent concretizations of the same spec produce the same spec
-    # object
-    for _ in range(5):
-        assert h == spack.concretize.concretize_one("hdf5")
-
-
 @pytest.mark.regression("42679")
 @pytest.mark.parametrize("compiler_str", ["gcc@=9.4.0", "gcc@=9.4.0-foo"])
 def test_selecting_compiler_with_suffix(mutable_config, mock_packages, compiler_str):
@@ -4278,3 +4228,134 @@ def test_when_possible_above_all(mutable_config, mock_packages):
     for result in solver.solve_in_rounds(specs):
         criteria = sorted(result.criteria, reverse=True)
         assert criteria[0].name == "number of input specs not concretized"
+
+
+def test_concretization_cache_roundtrip(
+    mock_packages, use_concretization_cache, monkeypatch, mutable_config
+):
+    """Tests whether we can write the results of a clingo solve to the cache
+    and load the same spec request from the cache to produce identical specs"""
+
+    assert spack.config.get("concretizer:concretization_cache:enable")
+
+    # run one standard concretization to populate the cache and the setup method
+    # memoization
+    h = spack.concretize.concretize_one("hdf5")
+
+    # ASP output should be stable, concretizing the same spec
+    # should have the same problem output
+    # assert that we're not storing any new cache entries
+    def _ensure_no_store(self, problem: str, result, statistics, test=False):
+        # always throw, we never want to reach this code path
+        assert False, "Concretization cache hit expected"
+
+    # Assert that we're actually hitting the cache
+    cache_fetch = spack.solver.asp.ConcretizationCache.fetch
+
+    def _ensure_cache_hits(self, problem: str):
+        result, statistics = cache_fetch(self, problem)
+        assert result, "Expected successful concretization cache hit"
+        assert statistics, "Expected statistics to be non null on cache hit"
+        return result, statistics
+
+    monkeypatch.setattr(spack.solver.asp.ConcretizationCache, "store", _ensure_no_store)
+    monkeypatch.setattr(spack.solver.asp.ConcretizationCache, "fetch", _ensure_cache_hits)
+    # ensure subsequent concretizations of the same spec produce the same spec
+    # object
+    for _ in range(5):
+        assert h == spack.concretize.concretize_one("hdf5")
+
+
+def test_concretization_cache_roundtrip_result(use_concretization_cache):
+    """Ensure the concretization cache doesn't change Solver Result objects."""
+    specs = [Spec("hdf5")]
+    solver = spack.solver.asp.Solver()
+
+    result1 = solver.solve(specs)
+    result2 = solver.solve(specs)
+
+    assert result1 == result2
+
+
+def test_concretization_cache_count_cleanup(use_concretization_cache, mutable_config):
+    """Tests to ensure we are cleaning the cache when we should be respective to the
+    number of entries allowed in the cache"""
+    conc_cache_dir = use_concretization_cache
+
+    spack.config.set("concretizer:concretization_cache:entry_limit", 1000)
+
+    def names():
+        return set(
+            x.name
+            for x in conc_cache_dir.iterdir()
+            if (not x.is_dir() and not x.name.startswith("."))
+        )
+
+    assert len(names()) == 0
+
+    for i in range(1000):
+        name = spack.util.hash.b32_hash(f"mock_cache_file_{i}")
+        mock_cache_file = conc_cache_dir / name
+        mock_cache_file.touch()
+
+    before = names()
+    assert len(before) == 1000
+
+    # cleanup should be run after the 1,001st execution
+    spack.concretize.concretize_one("py-black")
+
+    # ensure that half the elements were removed and that one more was created
+    after = names()
+    assert len(after) == 501
+    assert len(after - before) == 1  # one additional hash added by 1001st concretization
+
+
+def test_concretization_cache_uncompressed_entry(use_concretization_cache, monkeypatch):
+    def _store(self, problem, result, statistics):
+        cache_path = self._cache_path_from_problem(problem)
+        with self.write_transaction(cache_path) as exists:
+            if exists:
+                return
+            try:
+                with open(cache_path, "x", encoding="utf-8") as cache_entry:
+                    cache_dict = {"results": result.to_dict(), "statistics": statistics}
+                    cache_entry.write(json.dumps(cache_dict))
+            except FileExistsError:
+                pass
+
+    monkeypatch.setattr(spack.solver.asp.ConcretizationCache, "store", _store)
+    # Store the results in plaintext
+    spack.concretize.concretize_one("zlib")
+    # Ensure fetch can handle the plaintext cache entry
+    spack.concretize.concretize_one("zlib")
+
+
+@pytest.mark.parametrize(
+    "asp_file",
+    [
+        "concretize.lp",
+        "heuristic.lp",
+        "display.lp",
+        "direct_dependency.lp",
+        "when_possible.lp",
+        "libc_compatibility.lp",
+        "os_compatibility.lp",
+        "splices.lp",
+    ],
+)
+def test_concretization_cache_asp_canonicalization(asp_file):
+    path = os.path.join(os.path.dirname(spack.solver.asp.__file__), asp_file)
+
+    with open(path, "r", encoding="utf-8") as f:
+        original = [line.strip() for line in f.readlines()]
+        stripped = spack.solver.asp.strip_asp_problem(original)
+
+    diff = list(difflib.unified_diff(original, stripped))
+
+    assert all(
+        [
+            line == "-" or line.startswith("-%")
+            for line in diff
+            if line.startswith("-") and not line.startswith("---")
+        ]
+    )
