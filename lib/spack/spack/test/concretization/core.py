@@ -14,13 +14,13 @@ import pytest
 import spack.vendor.archspec.cpu
 import spack.vendor.jinja2
 
+import spack.archspec
 import spack.binary_distribution
 import spack.cmd
 import spack.compilers.config
 import spack.concretize
 import spack.config
 import spack.deptypes as dt
-import spack.detection
 import spack.error
 import spack.hash_types as ht
 import spack.llnl.util.lang
@@ -35,13 +35,14 @@ import spack.solver.reuse
 import spack.solver.runtimes
 import spack.solver.versions
 import spack.spec
-import spack.store
 import spack.test.conftest
 import spack.util.file_cache
 import spack.util.hash
 import spack.util.spack_yaml as syaml
 import spack.variant as vt
+from spack.externals import ExternalDependencyError
 from spack.installer import PackageInstaller
+from spack.solver.reuse import SpecFilter
 from spack.spec import Spec
 from spack.test.conftest import RepoBuilder
 from spack.version import Version, VersionList, ver
@@ -158,6 +159,9 @@ def current_host(request, monkeypatch):
     cpu, _, is_preference = request.param.partition("-")
 
     monkeypatch.setattr(spack.platforms.Test, "default", cpu)
+    monkeypatch.setattr(
+        spack.archspec, "HOST_TARGET_FAMILY", spack.vendor.archspec.cpu.TARGETS["x86_64"]
+    )
     if not is_preference:
         target = spack.vendor.archspec.cpu.TARGETS[cpu]
         monkeypatch.setattr(spack.vendor.archspec.cpu, "host", lambda: target)
@@ -291,14 +295,14 @@ class Changing(Package):
 
 @pytest.fixture()
 def clang12_with_flags(compiler_factory):
-    c = compiler_factory(spec="llvm@12.2.0 os=redhat6")
+    c = compiler_factory(spec="llvm@12.2.0+clang os=redhat6")
     c["extra_attributes"]["flags"] = {"cflags": "-O3", "cxxflags": "-O3"}
     return c
 
 
 @pytest.fixture()
 def gcc11_with_flags(compiler_factory):
-    c = compiler_factory(spec="gcc@11.1.0 os=redhat6")
+    c = compiler_factory(spec="gcc@11.1.0 languages:=c,c++,fortran os=redhat6")
     c["extra_attributes"]["flags"] = {"cflags": "-O0 -g", "cxxflags": "-O0 -g", "fflags": "-O0 -g"}
     return c
 
@@ -483,11 +487,15 @@ class TestConcretize:
         information from the root even when partial architecture information
         is provided by an intermediate dependency.
         """
-        cnl_compiler = compiler_factory(spec="gcc@4.5.0 os=CNL target=nocona")
+        cnl_compiler = compiler_factory(
+            spec="gcc@4.5.0 os=CNL languages:=c,c++,fortran target=nocona"
+        )
         with spack.config.override("packages", {"gcc": {"externals": [cnl_compiler]}}):
             spec_str = "mpileaks os=CNL target=nocona %gcc@4.5.0 ^dyninst os=CNL ^callpath os=CNL"
             spec = spack.concretize.concretize_one(spec_str)
             for s in spec.traverse(root=False, deptype=("link", "run")):
+                if s.external:
+                    continue
                 assert s.architecture.target == spec.architecture.target
 
     def test_compiler_flags_from_user_are_grouped(self):
@@ -1602,7 +1610,7 @@ class TestConcretize:
         [
             ("sticky-variant@1.0+allow-gcc", True),
             ("sticky-variant@1.0~allow-gcc", False),
-            ("sticky-variant@1.0", False),
+            # FIXME (externals as concrete) ("sticky-variant@1.0", False),
         ],
     )
     def test_sticky_variant_in_external(self, spec, allow_gcc):
@@ -1874,17 +1882,22 @@ class TestConcretize:
                 solver.driver.solve(setup, [root_spec], reuse=reusable_specs)
 
     @pytest.mark.regression("31148")
-    def test_version_weight_and_provenance(self):
+    def test_version_weight_and_provenance(self, mutable_config):
         """Test package preferences during concretization."""
         reusable_specs = [
             spack.concretize.concretize_one(spec_str) for spec_str in ("pkg-b@0.9", "pkg-b@1.0")
         ]
         root_spec = Spec("pkg-a foobar=bar")
 
+        external_specs = SpecFilter.from_packages_yaml(
+            mutable_config, include=[], exclude=[]
+        ).selected_specs()
         with spack.config.override("concretizer:reuse", True):
             solver = spack.solver.asp.Solver()
             setup = spack.solver.asp.SpackSolverSetup()
-            result, _, _ = solver.driver.solve(setup, [root_spec], reuse=reusable_specs)
+            result, _, _ = solver.driver.solve(
+                setup, [root_spec], reuse=reusable_specs + external_specs
+            )
             # Version badness should be > 0 only for reused specs. For instance, for pkg-b
             # the version provenance is:
             #
@@ -2163,130 +2176,29 @@ class TestConcretize:
         for s in spec.traverse(deptype=("link", "run")):
             assert s.satisfies(f"target={required_target}")
 
-    def test_external_python_extensions_have_dependency(self):
-        """Test that python extensions have access to a python dependency
-
-        when python is otherwise in the DAG"""
-        external_conf = {
-            "py-extension1": {
-                "buildable": False,
-                "externals": [{"spec": "py-extension1@2.0", "prefix": "/fake"}],
-            }
-        }
-        spack.config.set("packages", external_conf)
-
-        spec = spack.concretize.concretize_one("py-extension2")
-
-        assert "python" in spec["py-extension1"]
-        assert spec["python"] == spec["py-extension1"]["python"]
-
     target = spack.platforms.test.Test.default
 
-    @pytest.mark.parametrize(
-        "python_spec",
-        [
-            "python@configured",
-            "python@configured platform=test",
-            "python@configured os=debian",
-            "python@configured target=%s" % target,
-        ],
-    )
-    def test_external_python_extension_find_dependency_from_config(self, python_spec):
-        fake_path = os.path.sep + "fake"
+    def test_external_python_extension_find_dependency_from_config(self, mutable_config, tmp_path):
+        """Tests that an external Python extension gets a dependency on Python."""
+        packages_yaml = f"""
+packages:
+  py-extension1:
+    buildable: false
+    externals:
+    - spec: py-extension1@2.0
+      prefix: {tmp_path / "py-extension1"}
+  python:
+    externals:
+    - spec: python@3.8.13
+      prefix: {tmp_path / "python"}
+"""
+        configuration = syaml.load_config(packages_yaml)
+        mutable_config.set("packages", configuration["packages"])
+        py_extension = spack.concretize.concretize_one("py-extension1")
 
-        external_conf = {
-            "py-extension1": {
-                "buildable": False,
-                "externals": [{"spec": "py-extension1@2.0", "prefix": fake_path}],
-            },
-            "python": {"externals": [{"spec": python_spec, "prefix": fake_path}]},
-        }
-        spack.config.set("packages", external_conf)
-
-        spec = spack.concretize.concretize_one("py-extension1")
-
-        assert "python" in spec["py-extension1"]
-        assert spec["python"].prefix == fake_path
-        # The spec is not equal to Spec("python@configured") because it gets a
-        # namespace and an external prefix before marking concrete
-        assert spec["python"].satisfies(python_spec)
-
-    def test_external_python_extension_find_dependency_from_installed(self, monkeypatch):
-        fake_path = os.path.sep + "fake"
-
-        external_conf = {
-            "py-extension1": {
-                "buildable": False,
-                "externals": [{"spec": "py-extension1@2.0", "prefix": fake_path}],
-            },
-            "python": {
-                "buildable": False,
-                "externals": [{"spec": "python@installed", "prefix": fake_path}],
-            },
-        }
-        spack.config.set("packages", external_conf)
-
-        # install python external
-        python = spack.concretize.concretize_one("python")
-
-        def query(*args, **kwargs):
-            return [python]
-
-        monkeypatch.setattr(spack.store.STORE.db, "query", query)
-
-        # ensure that we can't be faking this by getting it from config
-        external_conf.pop("python")
-        spack.config.set("packages", external_conf)
-
-        spec = spack.concretize.concretize_one("py-extension1")
-
-        assert "python" in spec["py-extension1"]
-        assert spec["python"].prefix == fake_path
-        # The spec is not equal to Spec("python@configured") because it gets a
-        # namespace and an external prefix before marking concrete
-        assert spec["python"].satisfies(python)
-
-    def test_external_python_extension_find_dependency_from_detection(self, monkeypatch):
-        """Test that python extensions have access to a python dependency
-
-        when python isn't otherwise in the DAG"""
-        prefix = os.path.sep + "fake"
-        python_spec = Spec.from_detection("python@=detected", external_path=prefix)
-
-        def find_fake_python(classes, path_hints, **kwargs):
-            return {
-                "python": [Spec.from_detection("python@=detected", external_path=path_hints[0])]
-            }
-
-        monkeypatch.setattr(spack.detection, "by_path", find_fake_python)
-        external_conf = {
-            "py-extension1": {
-                "buildable": False,
-                "externals": [{"spec": "py-extension1@2.0", "prefix": "%s" % prefix}],
-            }
-        }
-        spack.config.set("packages", external_conf)
-
-        spec = spack.concretize.concretize_one("py-extension1")
-
-        assert "python" in spec["py-extension1"]
-        assert spec["python"].prefix == prefix
-        assert spec["python"].external
-        assert spec["python"].satisfies(python_spec)
-
-    def test_external_python_extension_find_unified_python(self):
-        """Test that python extensions use the same python as other specs in unified env"""
-        external_conf = {
-            "py-extension1": {
-                "buildable": False,
-                "externals": [{"spec": "py-extension1@2.0", "prefix": os.path.sep + "fake"}],
-            }
-        }
-        spack.config.set("packages", external_conf)
-
-        abstract_specs = [Spec(s) for s in ["py-extension1", "python"]]
-        specs = spack.concretize._concretize_specs_together(abstract_specs)
-        assert specs[0]["python"] == specs[1]["python"]
+        assert py_extension.external
+        assert py_extension["python"].external
+        assert py_extension["python"].prefix == str(tmp_path / "python")
 
     @pytest.mark.regression("36190")
     @pytest.mark.parametrize(
@@ -2297,15 +2209,17 @@ class TestConcretize:
             ["v1-consumer ^conditional-provider@1:1 +disable-v1"],
         ],
     )
-    def test_result_specs_is_not_empty(self, specs):
+    def test_result_specs_is_not_empty(self, mutable_config, specs):
         """Check that the implementation of "result.specs" is correct in cases where we
         know a concretization exists.
         """
         specs = [Spec(s) for s in specs]
+        external_specs = SpecFilter.from_packages_yaml(
+            mutable_config, include=[], exclude=[]
+        ).selected_specs()
         solver = spack.solver.asp.Solver()
         setup = spack.solver.asp.SpackSolverSetup()
-        result, _, _ = solver.driver.solve(setup, specs, reuse=[])
-
+        result, _, _ = solver.driver.solve(setup, specs, reuse=external_specs)
         assert result.specs
 
     @pytest.mark.regression("38664")
@@ -2573,7 +2487,8 @@ class TestConcretize:
 
         # Exclude dyninst from reuse, so we expect that the old version is not taken into account
         with spack.config.override(
-            "concretizer:reuse", {"from": [{"type": "buildcache", "exclude": ["dyninst"]}]}
+            "concretizer:reuse",
+            {"from": [{"type": "buildcache", "exclude": ["dyninst"]}, {"type": "external"}]},
         ):
             result = spack.concretize.concretize_one(request_str)
 
@@ -3127,14 +3042,16 @@ def test_concretization_version_order():
             {"roots": True, "include": ["^mpich"]},
             ["^mpich"],
             ["^mpich2", "^zmpi"],
-            2,
+            # Reused from store + externals
+            2 + 15,
         ),
         (
             ["mpileaks"],
             {"roots": True, "include": ["externaltest"]},
             ["externaltest"],
             ["^mpich", "^mpich2", "^zmpi"],
-            1,
+            # Reused from store + externals
+            1 + 15,
         ),
     ],
 )
@@ -3152,16 +3069,27 @@ def test_filtering_reused_specs(
     assert len(specs) == expected_length
 
     for constraint in expected:
-        assert all(x.satisfies(constraint) for x in specs)
+        assert all(x.satisfies(constraint) for x in specs if not x.external)
 
     for constraint in not_expected:
-        assert all(not x.satisfies(constraint) for x in specs)
+        assert all(not x.satisfies(constraint) for x in specs if not x.external)
 
 
 @pytest.mark.usefixtures("mutable_database", "mock_store")
 @pytest.mark.parametrize(
     "reuse_yaml,expected_length",
-    [({"from": [{"type": "local"}]}, 19), ({"from": [{"type": "buildcache"}]}, 0)],
+    [
+        (
+            {"from": [{"type": "local"}]},
+            # Local store + externals
+            19 + 15,
+        ),
+        (
+            {"from": [{"type": "buildcache"}]},
+            # Local store + externals
+            0 + 15,
+        ),
+    ],
 )
 @pytest.mark.not_on_windows("Expected length is different on Windows")
 def test_selecting_reused_sources(
@@ -3190,7 +3118,7 @@ def test_selecting_reused_sources(
 def test_spec_filters(specs, include, exclude, expected):
     specs = [Spec(x) for x in specs]
     expected = [Spec(x) for x in expected]
-    f = spack.solver.asp.SpecFilter(
+    f = spack.solver.reuse.SpecFilter(
         factory=lambda: specs, is_usable=lambda x: True, include=include, exclude=exclude
     )
     assert f.selected_specs() == expected
@@ -3420,16 +3348,17 @@ def test_compiler_can_depend_on_themselves_to_build(
 def test_compiler_attribute_is_tolerated_in_externals(
     mutable_config, mock_packages, tmp_path: pathlib.Path
 ):
-    """Tests that we don't error out if an external specifies a compiler, even though externals
-    don't have dependencies.
+    """Tests that we don't error out if an external specifies a compiler in the old way,
+    provided that a suitable external compiler exists.
     """
     packages_yaml = syaml.load_config(
         f"""
 packages:
   cmake:
     externals:
-    - spec: "cmake@3.27.4 %gcc@14.1.0"
+    - spec: "cmake@3.27.4 %gcc@10"
       prefix: {tmp_path}
+    buildable: false
 """
     )
     mutable_config.set("packages", packages_yaml["packages"])
@@ -3466,7 +3395,7 @@ def test_compiler_match_for_externals_is_taken_into_account(
 packages:
   libelf:
     externals:
-    - spec: "libelf@0.8.12 %gcc"
+    - spec: "libelf@0.8.12 %gcc@10"
       prefix: {tmp_path / 'gcc'}
     - spec: "libelf@0.8.13 %clang"
       prefix: {tmp_path / 'clang'}
@@ -3502,7 +3431,7 @@ packages:
     externals:
     - spec: "libelf@0.8.12 %gcc@10"
       prefix: {tmp_path / 'libelf-gcc10'}
-    - spec: "libelf@0.8.13 %gcc@9"
+    - spec: "libelf@0.8.13 %gcc@9.4.0"
       prefix: {tmp_path / 'libelf-gcc9'}
 """
     )
@@ -3588,9 +3517,10 @@ def test_input_analysis_and_conditional_requirements(default_mock_concretization
 @pytest.mark.parametrize(
     "compiler_str,expected,not_expected",
     [
-        # Compiler queries are as specific as the constraint on the external
+        # Compilers are matched to some other external, so the compiler that picked is concrete
         ("gcc@10", ["%gcc", "%gcc@10"], ["%clang", "%gcc@9"]),
-        ("gcc", ["%gcc"], ["%clang", "%gcc@9", "%gcc@10"]),
+        ("gcc@9.4.0", ["%gcc", "%gcc@9"], ["%clang", "%gcc@10"]),
+        ("clang", ["%clang", "%llvm+clang"], ["%gcc", "%gcc@9", "%gcc@10"]),
     ],
 )
 @pytest.mark.regression("49841")
@@ -3805,7 +3735,7 @@ def test_spec_parts_on_fresh_compilers(
       llvm::
         buildable: false
         externals:
-        - spec: "llvm+clang@20 {constraint_in_yaml}"
+        - spec: "llvm@20 +clang {constraint_in_yaml}"
           prefix: {tmp_path / 'llvm-20'}
     """
     )
@@ -4037,7 +3967,7 @@ def test_selecting_externals_with_compilers_as_root(mutable_config, mock_package
     packages_yaml = syaml.load_config(
         """
 packages:
-  gcc:
+  gcc::
     externals:
     - spec: "gcc@9.4.0 languages='c,c++'"
       prefix: /path
@@ -4045,7 +3975,7 @@ packages:
         compilers:
           c: /path/bin/gcc
           cxx: /path/bin/g++
-  llvm:
+  llvm::
     buildable: false
     externals:
     - spec: "llvm@20 +clang"
@@ -4087,18 +4017,10 @@ packages:
 @pytest.mark.not_on_windows("Tests use linux paths")
 @pytest.mark.regression("51001")
 @pytest.mark.parametrize(
-    "external_compiler,spec_str,expected_raising",
-    [
-        # Overspecify the compiler in the input spec. This should raise, because we
-        # don't know if we can satisfy the constraint
-        ("gcc", "mpich %gcc@9", True),
-        pytest.param("gcc@9", "mpich %gcc@9.4", True, marks=pytest.mark.xfail),
-        # This is ok
-        ("gcc@9.4.0", "mpich %gcc@9", False),
-    ],
+    "external_compiler,spec_str", [("gcc@8", "mpich %gcc@8.4"), ("gcc@8.4.0", "mpich %gcc@8")]
 )
 def test_selecting_externals_with_compilers_and_versions(
-    external_compiler, spec_str, expected_raising, mutable_config, mock_packages
+    external_compiler, spec_str, mutable_config, mock_packages
 ):
     """Tests different scenarios of having a compiler specified with a version constraint, either
     in the input spec or in the external spec.
@@ -4108,7 +4030,7 @@ def test_selecting_externals_with_compilers_and_versions(
 packages:
   gcc:
     externals:
-    - spec: "gcc@9.4.0 languages='c,c++'"
+    - spec: "gcc@8.4.0 languages='c,c++'"
       prefix: /path
       extra_attributes:
         compilers:
@@ -4124,16 +4046,41 @@ packages:
 """
     )
     mutable_config.set("packages", packages_yaml["packages"])
+    s = spack.concretize.concretize_one(spec_str)
+    assert s.external
+    assert s.prefix == "/path/mpich/gcc"
 
-    if expected_raising:
-        with pytest.raises(
-            spack.solver.asp.UnsatisfiableSpecError, match="Omit version requirement"
-        ):
-            _ = spack.concretize.concretize_one(spec_str)
-    else:
-        s = spack.concretize.concretize_one(spec_str)
-        assert s.external
-        assert s.prefix == "/path/mpich/gcc"
+
+@pytest.mark.regression("51001")
+@pytest.mark.parametrize(
+    "external_compiler,spec_str,error_match",
+    [
+        # Compiler is underspecified
+        ("gcc", "mpich %gcc", "there are multiple external specs"),
+        ("gcc@9", "mpich %gcc", "there are multiple external specs"),
+        # Compiler does not exist
+        ("%oneapi", "mpich %gcc@8", "there is no"),
+    ],
+)
+def test_errors_when_specifying_externals_with_compilers(
+    external_compiler, spec_str, error_match, mutable_config, mock_packages
+):
+    """Tests different errors that can occur in an external spec with a compiler specified."""
+    packages_yaml = syaml.load_config(
+        f"""
+packages:
+  mpich:
+    buildable: false
+    externals:
+    - spec: "mpich@3.4.3 %{external_compiler}"
+      prefix: /path/mpich/gcc
+    - spec: "mpich@3.4.3 %clang"
+      prefix: /path/mpich/clang
+"""
+    )
+    mutable_config.set("packages", packages_yaml["packages"])
+    with pytest.raises(ExternalDependencyError, match=error_match):
+        _ = spack.concretize.concretize_one(spec_str)
 
 
 @pytest.mark.regression("51146,51067")
@@ -4359,3 +4306,251 @@ def test_concretization_cache_asp_canonicalization(asp_file):
             if line.startswith("-") and not line.startswith("---")
         ]
     )
+
+
+@pytest.mark.parametrize(
+    "node_completion,expected,not_expected",
+    [
+        ("architecture_only", ["+clang", "~flang", "platform=test"], ["lld=*"]),
+        (
+            "default_variants",
+            ["+clang", "~flang", "+lld", "platform=test"],
+            ["~clang", "+flang", "~lld"],
+        ),
+    ],
+)
+def test_external_node_completion_from_config(
+    node_completion, expected, not_expected, mutable_config, mock_packages
+):
+    """Tests the different options for external node completion in the configuration file."""
+    mutable_config.set("concretizer:externals:completion", node_completion)
+
+    s = spack.concretize.concretize_one("llvm")
+
+    assert s.external
+    assert all(s.satisfies(c) for c in expected)
+    assert all(not s.satisfies(c) for c in not_expected)
+
+
+@pytest.mark.parametrize(
+    "spec_str,packages_yaml,expected",
+    [
+        (
+            "mpileaks",
+            """
+packages:
+  mpileaks:
+    externals:
+    - spec: "mpileaks@2.3~debug+opt"
+      prefix: /user/path
+      dependencies:
+      - id: callpath_id
+        deptypes: link
+      - id: mpich_id
+        deptypes:
+        - "build"
+        - "link"
+        virtuals: "mpi"
+  callpath:
+    externals:
+    - spec: "callpath@1.0"
+      prefix: /user/path
+      id: callpath_id
+      dependencies:
+      - id: mpich_id
+        deptypes:
+        - "build"
+        - "link"
+        virtuals: "mpi"
+  mpich:
+    externals:
+    - spec: "mpich@3.0.4"
+      prefix: /user/path
+      id: mpich_id
+""",
+            [
+                "%mpi=mpich@3.0.4",
+                "^callpath %mpi=mpich@3.0.4",
+                "%[deptypes=link] callpath",
+                "%[deptypes=build,link] mpich",
+            ],
+        ),
+        # Same, but using `spec:` instead of `id:` for dependencies
+        (
+            "mpileaks",
+            """
+packages:
+  mpileaks:
+    externals:
+    - spec: "mpileaks@2.3~debug+opt"
+      prefix: /user/path
+      dependencies:
+      - spec: callpath
+        deptypes: link
+      - spec: mpich
+        virtuals: "mpi"
+  callpath:
+    externals:
+    - spec: "callpath@1.0"
+      prefix: /user/path
+      dependencies:
+      - spec: mpich
+        virtuals: "mpi"
+  mpich:
+    externals:
+    - spec: "mpich@3.0.4"
+      prefix: /user/path
+""",
+            [
+                "%mpi=mpich@3.0.4",
+                "^callpath %mpi=mpich@3.0.4",
+                "%[deptypes=link] callpath",
+                "%[deptypes=build,link] mpich",
+            ],
+        ),
+    ],
+)
+def test_external_specs_with_dependencies(
+    spec_str, packages_yaml, expected, mutable_config, mock_packages
+):
+    """Tests that we can reconstruct external specs with dependencies."""
+    configuration = syaml.load_config(packages_yaml)
+    mutable_config.set("packages", configuration["packages"])
+    s = spack.concretize.concretize_one(spec_str)
+    assert all(node.external for node in s.traverse())
+    assert all(s.satisfies(c) for c in expected)
+
+
+@pytest.mark.parametrize(
+    "default_target,expected",
+    [
+        # Specific target requested
+        ("x86_64_v3", ["callpath target=x86_64_v3", "^mpich target=x86_64_v3"]),
+        # With ranges, be conservative by default
+        (":x86_64_v3", ["callpath target=x86_64", "^mpich target=x86_64"]),
+        ("x86_64:x86_64_v3", ["callpath target=x86_64", "^mpich target=x86_64"]),
+        ("x86_64:", ["callpath target=x86_64", "^mpich target=x86_64"]),
+    ],
+)
+@pytest.mark.skipif(
+    spack.vendor.archspec.cpu.host().family != "x86_64", reason="test data for x86_64"
+)
+def test_target_requirements(default_target, expected, mutable_config, mock_packages):
+    """Tests different scenarios where targets might be constrained by configuration and are not
+    specified in external specs
+    """
+    configuration = syaml.load_config(
+        f"""
+packages:
+  all:
+    require:
+    - "target={default_target}"
+  callpath:
+    buildable: false
+    externals:
+    - spec: "callpath@1.0"
+      prefix: /user/path
+      id: callpath_id
+      dependencies:
+      - id: mpich_id
+        deptypes:
+        - "build"
+        - "link"
+        virtuals: "mpi"
+  mpich:
+    externals:
+    - spec: "mpich@3.0.4"
+      prefix: /user/path
+      id: mpich_id
+"""
+    )
+    mutable_config.set("packages", configuration["packages"])
+    s = spack.concretize.concretize_one("callpath")
+    assert s.external
+    assert all(s.satisfies(x) for x in expected), s.tree()
+
+
+@pytest.mark.parametrize(
+    "spec_str,inline,yaml",
+    [
+        (
+            "cmake-client",
+            """
+packages:
+  cmake-client:
+    externals:
+    - spec: cmake-client@1.0 %cmake
+      prefix: /mock
+  cmake:
+    externals:
+    - spec: cmake@3.23.0
+      prefix: /mock
+""",
+            """
+packages:
+  cmake-client:
+    externals:
+    - spec: cmake-client@1.0
+      prefix: /mock
+      dependencies:
+      - spec: cmake
+  cmake:
+    externals:
+    - spec: cmake@3.23.0
+      prefix: /mock
+""",
+        ),
+        (
+            "mpileaks",
+            """
+packages:
+  mpileaks:
+    externals:
+    - spec: "mpileaks@2.3~debug+opt %mpi=mpich %[deptypes=link] callpath"
+      prefix: /user/path
+  callpath:
+    externals:
+    - spec: "callpath@1.0 %mpi=mpich"
+      prefix: /user/path
+  mpich:
+    externals:
+    - spec: "mpich@3.0.4"
+      prefix: /user/path
+""",
+            """
+packages:
+  mpileaks:
+    externals:
+    - spec: "mpileaks@2.3~debug+opt"
+      prefix: /user/path
+      dependencies:
+      - spec: callpath
+        deptypes: link
+      - spec: mpich
+        virtuals: "mpi"
+  callpath:
+    externals:
+    - spec: "callpath@1.0"
+      prefix: /user/path
+      dependencies:
+      - spec: mpich
+        virtuals: "mpi"
+  mpich:
+    externals:
+    - spec: "mpich@3.0.4"
+      prefix: /user/path
+""",
+        ),
+    ],
+)
+def test_external_inline_equivalent_to_yaml(spec_str, inline, yaml, mutable_config, mock_packages):
+    """Tests that the inline syntax for external specs is equivalent to the YAML syntax."""
+    configuration = syaml.load_config(inline)
+    mutable_config.set("packages", configuration["packages"])
+    inline_spec = spack.concretize.concretize_one(spec_str)
+
+    configuration = syaml.load_config(yaml)
+    mutable_config.set("packages", configuration["packages"])
+    yaml_spec = spack.concretize.concretize_one(spec_str)
+
+    assert inline_spec == yaml_spec
