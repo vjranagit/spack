@@ -1056,7 +1056,7 @@ complete -c spack -n '__fish_spack_using_command clean' -s p -l python-cache -d 
 complete -c spack -n '__fish_spack_using_command clean' -s b -l bootstrap -f -a bootstrap
 complete -c spack -n '__fish_spack_using_command clean' -s b -l bootstrap -d 'remove software and configuration needed to bootstrap Spack'
 complete -c spack -n '__fish_spack_using_command clean' -s a -l all -f -a all
-complete -c spack -n '__fish_spack_using_command clean' -s a -l all -d 'equivalent to ``-sdfmp`` (does not include ``--bootstrap``)'
+complete -c spack -n '__fish_spack_using_command clean' -s a -l all -d 'equivalent to ``-sdfmpb``'
 
 # spack commands
 set -g __fish_spack_optspecs_spack_commands h/help update-completion a/aliases format= header= update=
