@@ -38,7 +38,6 @@ import spack.util.spack_json as sjson
 import spack.util.spack_yaml as syaml
 import spack.variant as vt
 from spack import traverse
-from spack.installer import PackageInstaller
 from spack.llnl.util.filesystem import copy_tree, islink, readlink, symlink
 from spack.llnl.util.link_tree import ConflictingSpecsError
 from spack.schema.env import TOP_LEVEL_KEY
@@ -1980,8 +1979,14 @@ class Environment:
             *(s.dag_hash() for s in roots),
         }
 
+        if spack.config.get("config:installer", "old") == "new":
+            from spack.new_installer import PackageInstaller
+        else:
+            from spack.installer import PackageInstaller  # type: ignore[assignment]
+
+        builder = PackageInstaller([spec.package for spec in specs], **install_args)
+
         try:
-            builder = PackageInstaller([spec.package for spec in specs], **install_args)
             builder.install()
         finally:
             if reporter:
