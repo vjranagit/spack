@@ -1668,7 +1668,11 @@ class PackageBase(WindowsRPath, PackageViewMixin, metaclass=PackageMeta):
         self.stage.create()
 
         # Fetch/expand any associated code.
-        if self.has_code and not self.spec.external:
+        user_dev_path = spack.config.get(f"develop:{self.name}:path", None)
+        skip = user_dev_path and os.path.exists(user_dev_path)
+        if skip:
+            tty.debug("Skipping staging because develop path exists")
+        if self.has_code and not self.spec.external and not skip:
             self.do_fetch(mirror_only)
             self.stage.expand_archive()
         else:
