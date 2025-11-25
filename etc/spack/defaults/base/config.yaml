@@ -150,27 +150,28 @@ config:
   # If set to 'urllib', Spack will use python built-in libs to fetch
   url_fetch_method: urllib
 
-  # The maximum number of jobs to use for the build system (e.g. `make`), when
-  # the -j flag is not given on the command line. Defaults to 16 when not set.
-  # Note that the maximum number of jobs is limited by the number of cores
-  # available, taking thread affinity into account when supported.
-  # For instance:
-  # - With `build_jobs: 16` and 4 cores available `spack install` will run `make -j4`
-  # - With `build_jobs: 16` and 32 cores available `spack install` will run `make -j16`
-  # - With `build_jobs: 2` and 4 cores available `spack install -j6` will run `make -j6`
+  # Suggested maximum number of build jobs (e.g., `make -jN` or `ninja -jN`).
+  # The effective number of jobs is capped by available cores unless `-j` is specified.
+  # With `-j / --jobs` on the command line, that value is used without capping.
+  # Examples (assuming `build_jobs: 16`):
+  # - 4 cores available: `spack install` uses 4 jobs
+  # - 32 cores available: `spack install` uses 16 jobs
+  # - Any cores available: `spack install -j6` uses 6 jobs (no cap applied)
+  # Old installer: `build_jobs` applies per package, so total load is
+  #   `build_jobs * concurrent_packages`.
+  # New installer: `build_jobs` is global across all packages via a job server,
+  #   keeping CPU load roughly constant regardless of `concurrent_packages`.
   build_jobs: 16
 
-  # The maximum number of concurrent package builds a single Spack instance will run,
-  # when the `-p` / `--concurrent-packages`  flag is not given on the command line.
-  # Defaults to 1 when not set.
-  # Generally, big builds like LLVM are going to perform better with a higher -j, and
-  # builds with lots of dependencies may build better with higher -p. It is currently
-  # up to the user to balance between -j (build_jobs) and -p (concurrent_packages)
-  # on `spack install`, but this will be less of an issue in the future when we
-  # introduce support for the gmake job server and allow more dynamic parallelism.
-  # This, like `build_jobs`, is also limited by available cores.
-  # Note: This option has no effect on windows, as parallel builds are disabled on
-  # windows due to a lack of filesystem locks.
+  # Maximum number of packages to build concurrently (when `-p` is not given).
+  # Old installer: limit this to avoid `build_jobs * concurrent_packages` exceeding
+  #   available cores. Concurrent package builds are disabled by default.
+  # New installer: packages share a global `build_jobs` pool via job server, so
+  #   higher values don't increase CPU load. Concurrent package builds are enabled
+  #   by default. Use this to limit parallel source fetches or disk space usage.
+  #   The value 1 is ignored; use `-p 1` on the command line to explicitly limit
+  #   to one package at a time.
+  # Note: this option has no effect on Windows.
   concurrent_packages: 1
 
   # Which installer to use: "old" or "new". The new installer is experimental.

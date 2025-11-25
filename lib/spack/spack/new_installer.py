@@ -1241,7 +1241,6 @@ class PackageInstaller:
             raise NotImplementedError("Stopping before an install phase is not implemented")
         elif tests is not False:
             raise NotImplementedError("Tests during install are not implemented")
-        # verbose and concurrent_packages are not worth erroring out for
 
         specs = [pkg.spec for pkg in packages]
 
@@ -1294,6 +1293,17 @@ class PackageInstaller:
         self.running_builds: Dict[int, ChildInfo] = {}
         self.build_status = BuildStatus(len(self.build_graph.nodes))
         self.jobs = spack.config.determine_number_of_jobs(parallel=True)
+        if concurrent_packages is None:
+            # If no command line override, get from config, and treat 1 as unlimited, because
+            # the 1 value is the historical default of the old installer where concurrency was
+            # disabled by default.
+            concurrent_packages_config = spack.config.get("config:concurrent_packages", 1)
+            if concurrent_packages_config == 1:
+                self.capacity = sys.maxsize
+            else:
+                self.capacity = concurrent_packages_config
+        else:
+            self.capacity = concurrent_packages
         self.reports: Dict[str, spack.report.RequestRecord] = {}
 
     def install(self) -> None:
@@ -1342,10 +1352,11 @@ class PackageInstaller:
                 self._start(selector, jobserver)
 
             while self.pending_builds or self.running_builds or to_insert_in_database:
-                # Only monitor the jobserver if we have pending builds.
-                if self.pending_builds and jobserver.r not in selector.get_map():
+                # Only monitor the jobserver if we have pending builds and capacity.
+                can_schedule_more = self.pending_builds and self.capacity > 0
+                if can_schedule_more and jobserver.r not in selector.get_map():
                     selector.register(jobserver.r, selectors.EVENT_READ, "jobserver")
-                elif not self.pending_builds and jobserver.r in selector.get_map():
+                elif not can_schedule_more and jobserver.r in selector.get_map():
                     selector.unregister(jobserver.r)
 
                 children_have_finished = False
@@ -1378,6 +1389,7 @@ class PackageInstaller:
                         pass
                     for pid in reap_children(self.running_builds, selector, jobserver):
                         build = self.running_builds.pop(pid)
+                        self.capacity += 1
                         if build.proc.exitcode == 0:
                             to_insert_in_database.append(build)
                             self.build_status.update_state(build.spec.dag_hash(), "finished")
@@ -1416,10 +1428,11 @@ class PackageInstaller:
                     self._start(selector, jobserver)
 
                 # For the rest we try to obtain tokens from the jobserver.
-                if self.pending_builds and jobserver_token_available:
-                    # Then we try to schedule as many jobs as we can acquire tokens for.
-                    max_new_jobs = len(self.pending_builds)
-                    for _ in range(jobserver.acquire(max_new_jobs)):
+                if self.pending_builds and self.capacity > 0 and jobserver_token_available:
+                    # Schedule as many jobs as we can acquire tokens for.
+                    max_new_jobs = min(len(self.pending_builds), self.capacity)
+                    num_acquired = jobserver.acquire(max_new_jobs)
+                    for _ in range(num_acquired):
                         self._start(selector, jobserver)
 
                 # Finally update the UI
@@ -1466,6 +1479,7 @@ class PackageInstaller:
             db.lock.release_write(db._write)
 
     def _start(self, selector: selectors.BaseSelector, jobserver: JobServer) -> None:
+        self.capacity -= 1
         dag_hash = self.pending_builds.pop()
         explicit = dag_hash in self.explicit
         spec = self.build_graph.nodes[dag_hash]
