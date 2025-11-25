@@ -587,32 +587,29 @@ imposed_packages(ID, A1) :- imposed_constraint(ID, _, A1, _, _).
 imposed_packages(ID, A1) :- imposed_constraint(ID, _, A1, _, _, _).
 imposed_packages(ID, A1) :- imposed_constraint(ID, "depends_on", _, A1, _).
 
-imposed_nodes(EffectID, node(NodeID, Package), node(X, A1))
-  :- trigger_and_effect(Package, TriggerID, EffectID),
-     imposed_packages(EffectID, A1),
-     condition_set(node(NodeID, Package), node(X, A1)),
-     trigger_requestor_node(TriggerID, node(NodeID, Package)),
+imposed_nodes(node(NodeID, Package), node(X, A1))
+  :- condition_set(node(NodeID, Package), node(X, A1)),
      % We don't want to add build requirements to imposed nodes, to avoid
      % unsat problems when we deal with self-dependencies: gcc@14 %gcc@10
      not self_build_requirement(node(NodeID, Package), node(X, A1)).
 
 self_build_requirement(node(X, Package), node(Y, Package)) :- build_requirement(node(X, Package), node(Y, Package)).
 
-imposed_nodes(ConditionID, PackageNode, node(X, A1))
+imposed_nodes(PackageNode, node(X, A1))
   :- imposed_packages(ConditionID, A1),
      condition_set(PackageNode, node(X, A1)),
      attr("hash", PackageNode, ConditionID).
 
 :- imposed_packages(ID, A1), impose(ID, PackageNode), not condition_set(PackageNode, node(_, A1)),
    internal_error("Imposing constraint outside of condition set").
-:- imposed_packages(ID, A1), impose(ID, PackageNode), not imposed_nodes(ID, PackageNode, node(_, A1)),
+:- imposed_packages(ID, A1), impose(ID, PackageNode), not imposed_nodes(PackageNode, node(_, A1)),
    internal_error("Imposing constraint outside of imposed_nodes").
 
 % Conditions that hold impose may impose constraints on other specs
-attr(Name, node(X, A1))             :- impose(ID, PackageNode), imposed_constraint(ID, Name, A1),             imposed_nodes(ID, PackageNode, node(X, A1)).
-attr(Name, node(X, A1), A2)         :- impose(ID, PackageNode), imposed_constraint(ID, Name, A1, A2),         imposed_nodes(ID, PackageNode, node(X, A1)), not node_attributes_with_custom_rules(Name).
-attr(Name, node(X, A1), A2, A3)     :- impose(ID, PackageNode), imposed_constraint(ID, Name, A1, A2, A3),     imposed_nodes(ID, PackageNode, node(X, A1)), not node_attributes_with_custom_rules(Name).
-attr(Name, node(X, A1), A2, A3, A4) :- impose(ID, PackageNode), imposed_constraint(ID, Name, A1, A2, A3, A4), imposed_nodes(ID, PackageNode, node(X, A1)).
+attr(Name, node(X, A1))             :- impose(ID, PackageNode), imposed_constraint(ID, Name, A1),             imposed_nodes(PackageNode, node(X, A1)).
+attr(Name, node(X, A1), A2)         :- impose(ID, PackageNode), imposed_constraint(ID, Name, A1, A2),         imposed_nodes(PackageNode, node(X, A1)), not node_attributes_with_custom_rules(Name).
+attr(Name, node(X, A1), A2, A3)     :- impose(ID, PackageNode), imposed_constraint(ID, Name, A1, A2, A3),     imposed_nodes(PackageNode, node(X, A1)), not node_attributes_with_custom_rules(Name).
+attr(Name, node(X, A1), A2, A3, A4) :- impose(ID, PackageNode), imposed_constraint(ID, Name, A1, A2, A3, A4), imposed_nodes(PackageNode, node(X, A1)).
 
 % Provider set is relevant only for literals, since it's the only place where `^[virtuals=foo] bar`
 % might appear in the HEAD of a rule
@@ -637,7 +634,7 @@ provider(ProviderNode, VirtualNode) :- attr("provider_set", ProviderNode, Virtua
 % should not make foo:=a,b,c possible
 attr("concrete_variant_set", node(X, A1), Variant, Value, ID)
   :- impose(ID, PackageNode),
-     imposed_nodes(ID, PackageNode, node(X, A1)),
+     imposed_nodes(PackageNode, node(X, A1)),
      imposed_constraint(ID, "concrete_variant_set", A1, Variant, Value).
 
 
@@ -1807,7 +1804,7 @@ attr("node_os", PackageNode, OS) :- attr("node_os_set", PackageNode, OS), attr("
 %-----------------------------------------------------------------------------
 
 % Each node has only one target chosen among the known targets
-{ attr("node_target", PackageNode, Target) : target(Target) } :- attr("node", PackageNode).
+1 { attr("node_target", PackageNode, Target) : target(Target) } 1 :- attr("node", PackageNode).
 
 % If a node must satisfy a target constraint, enforce it
 error(10, "'{0} target={1}' cannot satisfy constraint 'target={2}'", Package, Target, Constraint)
@@ -1829,9 +1826,9 @@ error(100, "Cannot find compatible targets for {0} and {1}", Package, Dependency
 % Intermediate step for performance reasons
 % When the integrity constraint above was formulated including this logic
 % we suffered a substantial performance penalty
-node_target_compatible(PackageNode, Target)
- :- attr("node_target", PackageNode, MyTarget),
-    target_compatible(Target, MyTarget).
+node_target_compatible(ChildNode, ParentTarget)
+ :- attr("node_target", ChildNode, ChildTarget),
+    target_compatible(ParentTarget, ChildTarget).
 
 #defined target_satisfies/2.
 compiler(Compiler) :- target_supported(Compiler, _, _).
@@ -2140,7 +2137,7 @@ opt_criterion(48, "preferred providers (non-roots)").
 
 compiler_penalty(PackageNode, C-1) :-
    C = #count { CompilerNode : node_compiler(PackageNode, CompilerNode) },
-   node_compiler(PackageNode, _).
+   node_compiler(PackageNode, _), C > 0.
 
 opt_criterion(46, "number of compilers used on the same node").
 #minimize{ 0@246: #true }.
