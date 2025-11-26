@@ -150,6 +150,9 @@ config:
   # If set to 'urllib', Spack will use python built-in libs to fetch
   url_fetch_method: urllib
 
+  # Which installer to use: "old" or "new". The new installer is experimental.
+  installer: old
+
   # Suggested maximum number of build jobs (e.g., `make -jN` or `ninja -jN`).
   # The effective number of jobs is capped by available cores unless `-j` is specified.
   # With `-j / --jobs` on the command line, that value is used without capping.
@@ -169,13 +172,10 @@ config:
   # New installer: packages share a global `build_jobs` pool via job server, so
   #   higher values don't increase CPU load. Concurrent package builds are enabled
   #   by default. Use this to limit parallel source fetches or disk space usage.
-  #   The value 1 is ignored; use `-p 1` on the command line to explicitly limit
-  #   to one package at a time.
+  # The default value 0 means package parallelism is disabled for the
+  # old installer and enabled for the new installer with no limit.
   # Note: this option has no effect on Windows.
-  concurrent_packages: 1
-
-  # Which installer to use: "old" or "new". The new installer is experimental.
-  installer: old
+  concurrent_packages: 0
 
   # If set to true, Spack will use ccache to cache C compiles.
   ccache: false

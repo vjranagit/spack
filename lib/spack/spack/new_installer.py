@@ -1294,11 +1294,9 @@ class PackageInstaller:
         self.build_status = BuildStatus(len(self.build_graph.nodes))
         self.jobs = spack.config.determine_number_of_jobs(parallel=True)
         if concurrent_packages is None:
-            # If no command line override, get from config, and treat 1 as unlimited, because
-            # the 1 value is the historical default of the old installer where concurrency was
-            # disabled by default.
-            concurrent_packages_config = spack.config.get("config:concurrent_packages", 1)
-            if concurrent_packages_config == 1:
+            concurrent_packages_config = spack.config.get("config:concurrent_packages", 0)
+            # The value 0 in config means no limit (other than self.jobs)
+            if concurrent_packages_config == 0:
                 self.capacity = sys.maxsize
             else:
                 self.capacity = concurrent_packages_config

@@ -215,15 +215,15 @@ class TestPackageInstallerConstructor:
     def test_capacity_from_config_default_one(
         self, temporary_store, mock_packages, mutable_config
     ):
-        """Test that config value of 1 is treated as unlimited (historical default)."""
-        mutable_config.set("config:concurrent_packages", 1)
+        """Test that config value of 0 is treated as unlimited."""
+        mutable_config.set("config:concurrent_packages", 0)
         spec = spack.spec.Spec("trivial-install-test-package")
         spec._mark_concrete()
         assert PackageInstaller([spec.package]).capacity == sys.maxsize
 
-    def test_capacity_from_config_non_one(self, temporary_store, mock_packages, mutable_config):
-        """Test that non-1 config values are used as-is."""
-        mutable_config.set("config:concurrent_packages", 8)
+    def test_capacity_from_config_non_zero(self, temporary_store, mock_packages, mutable_config):
+        """Test that non-0 config values are used as-is."""
+        mutable_config.set("config:concurrent_packages", 1)
         spec = spack.spec.Spec("trivial-install-test-package")
         spec._mark_concrete()
-        assert PackageInstaller([spec.package]).capacity == 8
+        assert PackageInstaller([spec.package]).capacity == 1
