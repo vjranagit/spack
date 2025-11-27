@@ -1516,6 +1516,9 @@ class PackageInstaller:
 
         if concurrent_packages is None:
             concurrent_packages = spack.config.get("config:concurrent_packages", default=1)
+        # The value 0 means no concurrency.
+        if concurrent_packages == 0:
+            concurrent_packages = 1
         self.concurrent_packages = concurrent_packages
 
         install_args = {
