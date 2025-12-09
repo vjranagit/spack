@@ -48,9 +48,8 @@ def migrate_v1_to_v2(
 
     namespace = repo.namespace.split(".")
 
-    if not all(
-        spack.util.naming.valid_module_name(part, package_api=(2, 0)) for part in namespace
-    ):
+    naming_scheme = spack.util.naming.get_naming_scheme((2, 0))
+    if not all(naming_scheme.valid_module_name(part) for part in namespace):
         print(
             f"Cannot upgrade from v1 to v2, because the namespace '{repo.namespace}' is not a "
             "valid Python module",
