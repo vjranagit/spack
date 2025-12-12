@@ -359,6 +359,7 @@ nitpick_ignore = [
     ("py:class", "TextIO"),
     ("py:class", "hashlib._Hash"),
     ("py:class", "concurrent.futures._base.Executor"),
+    ("py:class", "multiprocessing.context.BaseContext"),
     ("py:class", "multiprocessing.context.Process"),
     ("py:class", "posix.DirEntry"),
     ("py:class", "spack.vendor.jinja2.Environment"),
