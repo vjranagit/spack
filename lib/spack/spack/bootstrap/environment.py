@@ -91,7 +91,7 @@ class BootstrapEnvironment(spack.environment.Environment):
             tty.msg(f"[BOOTSTRAPPING] Installing dependencies ({', '.join(colorized_specs)})")
             self.write(regenerate=False)
             with tty.SuppressOutput(msg_enabled=log_enabled, warn_enabled=log_enabled):
-                self.install_all(fail_fast=True)
+                self.install_all()
                 self.write(regenerate=True)
 
     def load(self) -> None:
