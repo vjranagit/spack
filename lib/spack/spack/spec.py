@@ -1780,7 +1780,6 @@ class Spec:
                 f"Propagation with '==' is not supported for '{name}'."
             )
 
-        valid_flags = FlagMap.valid_compiler_flags()
         if name == "arch" or name == "architecture":
             assert type(value) is str, "architecture have a string value"
             parts = tuple(value.split("-"))
@@ -1794,7 +1793,7 @@ class Spec:
             self._set_architecture(target=value)
         elif name == "namespace":
             self.namespace = value
-        elif name in valid_flags:
+        elif name in _valid_compiler_flags:
             assert self.compiler_flags is not None
             assert type(value) is str, f"{name} must have a string value"
             flags_and_propagation = spack.compilers.flags.tokenize_flags(value, propagate)
