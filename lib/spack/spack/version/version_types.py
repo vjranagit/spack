@@ -1089,6 +1089,27 @@ class VersionList(VersionType):
             return VersionList([Version(dictionary["version"])])
         raise ValueError("Dict must have 'version' or 'versions' in it.")
 
+    @staticmethod
+    def _from_version_list_string(version_list_string: str) -> "VersionList":
+        """Converts a version list string to a VersionType. Used by the parser, where we know no
+        git versions are present."""
+        version_list = VersionList()
+
+        for string in version_list_string.replace(" ", "").split(","):
+            if ":" in string:
+                s, e = string.split(":")
+                lo = StandardVersion.typemin() if s == "" else StandardVersion.from_string(s)
+                hi = StandardVersion.typemax() if e == "" else StandardVersion.from_string(e)
+                version_list.add(VersionRange(lo, hi))
+            elif string.startswith("="):
+                version_list.add(StandardVersion.from_string(string[1:]))
+            else:
+                # @1.2.3 is short for 1.2.3:1.2.3
+                v = StandardVersion.from_string(string)
+                version_list.add(VersionRange(v, v))
+
+        return version_list
+
     @classmethod
     def any(cls) -> "VersionList":
         """Return a VersionList that matches any version."""
