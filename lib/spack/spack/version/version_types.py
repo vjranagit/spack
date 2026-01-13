@@ -245,7 +245,8 @@ class StandardVersion(ConcreteVersion):
 
     @staticmethod
     def from_string(string: str) -> "StandardVersion":
-        return StandardVersion(string, *parse_string_components(string))
+        version, separators = parse_string_components(string)
+        return StandardVersion(string, version, separators)
 
     @staticmethod
     def typemin() -> "StandardVersion":
@@ -1093,20 +1094,23 @@ class VersionList(VersionType):
     def _from_version_list_string(version_list_string: str) -> "VersionList":
         """Converts a version list string to a VersionType. Used by the parser, where we know no
         git versions are present."""
-        version_list = VersionList()
+        version_list = VersionList.__new__(VersionList)
+        version_list.versions = []
+        add_version = version_list.versions.append  # first version is appended directly
 
         for string in version_list_string.replace(" ", "").split(","):
             if ":" in string:
-                s, e = string.split(":")
-                lo = StandardVersion.typemin() if s == "" else StandardVersion.from_string(s)
-                hi = StandardVersion.typemax() if e == "" else StandardVersion.from_string(e)
-                version_list.add(VersionRange(lo, hi))
+                s, _, e = string.partition(":")
+                lo = _STANDARD_VERSION_TYPEMIN if s == "" else StandardVersion.from_string(s)
+                hi = _STANDARD_VERSION_TYPEMAX if e == "" else StandardVersion.from_string(e)
+                add_version(ClosedOpenRange.from_version_range(lo, hi))
             elif string.startswith("="):
-                version_list.add(StandardVersion.from_string(string[1:]))
+                add_version(StandardVersion.from_string(string[1:]))
             else:
                 # @1.2.3 is short for 1.2.3:1.2.3
                 v = StandardVersion.from_string(string)
-                version_list.add(VersionRange(v, v))
+                add_version(ClosedOpenRange.from_version_range(v, v))
+            add_version = version_list.add  # subsequent versions go through add()
 
         return version_list
 
