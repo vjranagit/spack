@@ -5052,9 +5052,18 @@ class Spec:
                 self._dunder_hash = self.dag_hash_bit_prefix(64)
             return self._dunder_hash
 
-        # This is the normal hash for lazy_lexicographic_ordering. It's
-        # slow for large specs because it traverses the whole spec graph,
-        # so we hope it only runs on abstract specs, which are small.
+        if not self._dependencies:
+            return hash(
+                (
+                    self.name,
+                    self.namespace,
+                    self.versions,
+                    (self.variants if self.variants.dict else None),
+                    self.architecture,
+                    self.abstract_hash,
+                )
+            )
+
         return hash(lang.tuplify(self._cmp_iter))
 
     def __getstate__(self):
