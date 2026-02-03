@@ -252,3 +252,59 @@ class ConfigManager:
         # Write packages.yaml
         packages_data = {
             "packages": {
+                name: {
+                    "version": [pkg.version] if pkg.version else [],
+                    "variants": " ".join(pkg.variants),
+                    "buildable": pkg.buildable,
+                }
+                for name, pkg in config.packages.items()
+            }
+        }
+
+        with open(output_path / "packages.yaml", "w") as f:
+            yaml.dump(packages_data, f, default_flow_style=False, sort_keys=False)
+
+        # Write config.yaml
+        config_data = {
+            "config": {
+                "install_tree": {
+                    "root": f"/opt/spack/{config.site_name}",
+                    "projections": {"all": "{name}-{version}-{hash:7}"},
+                },
+                "build_stage": [f"/tmp/spack-stage/{config.site_name}"],
+                "source_cache": f"~/.spack/cache/{config.site_name}",
+            }
+        }
+
+        with open(output_path / "config.yaml", "w") as f:
+            yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
+
+        # Write modules.yaml
+        modules_data = {
+            "modules": {
+                "default": {
+                    "enable": ["lmod"],
+                    "lmod": {
+                        "core_compilers": [
+                            f"{c.name}@{c.version}" for c in config.compilers[:1]
+                        ],
+                        "hierarchy": ["mpi"],
+                    },
+                }
+            }
+        }
+
+        with open(output_path / "modules.yaml", "w") as f:
+            yaml.dump(modules_data, f, default_flow_style=False, sort_keys=False)
+
+        # Write metadata
+        metadata = {
+            "site": config.site_name,
+            "architecture": config.architecture,
+            "provider": config.provider,
+            "generated_by": "spack-ext",
+            **config.metadata,
+        }
+
+        with open(output_path / "metadata.yaml", "w") as f:
+            yaml.dump(metadata, f, default_flow_style=False, sort_keys=False)

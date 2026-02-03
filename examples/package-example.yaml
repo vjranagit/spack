@@ -1,0 +1,37 @@
+name: neurosim-toolkit
+family: neuroscience
+version: 3.2.1
+
+description: Neural simulation toolkit with MPI support
+
+dependencies:
+  - python@3.11:
+  - py-numpy@1.24:
+  - py-scipy@1.11:
+  - hdf5+mpi
+  - openmpi@4.1:
+
+profiles:
+  quick:
+    variants: [~optimization, ~mpi]
+    cflags: "-O1"
+
+  optimized:
+    variants: [+optimization, +mpi, +avx512]
+    cflags: "-O3 -march=native -mtune=native"
+    cxxflags: "-O3 -march=native -mtune=native"
+
+  debug:
+    variants: [+debug, ~optimization, +mpi]
+    cflags: "-g -O0 -Wall"
+    cxxflags: "-g -O0 -Wall"
+
+compatibility:
+  python: ">=3.9,<3.13"
+  numpy: ">=1.20"
+  hdf5: ">=1.10"
+
+metadata:
+  homepage: "https://example.com/neurosim"
+  maintainer: "neurosim-team"
+  license: "MIT"

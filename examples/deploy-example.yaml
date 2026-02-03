@@ -1,0 +1,34 @@
+deployment:
+  name: production-2024
+  base_path: /opt/spack
+
+  stages:
+    - name: compilers
+      environment: environments/compilers.yaml
+      depends: []
+      parallel: 1
+      artifacts:
+        - compilers.yaml
+
+    - name: externals
+      environment: environments/externals.yaml
+      depends: [compilers]
+      parallel: 2
+      artifacts:
+        - packages.yaml
+        - compilers.yaml
+
+    - name: applications
+      environment: environments/applications.yaml
+      depends: [externals]
+      parallel: 4
+      artifacts:
+        - modules
+
+  artifacts:
+    propagate: [compilers.yaml, packages.yaml]
+    output: /opt/spack/deployments/2024-01-18
+
+  metadata:
+    version: "1.0"
+    maintainer: "hpc-admin"
